@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tianji"
+version = "0.1.0"
+description = "天机: 多 CLI 编程助手协作框架(最小原型)"
+requires-python = ">=3.9"
+dependencies = ["typer"]
+
+[project.scripts]
+tianji = "tianji.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["tianji*"]
