@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 本地环境设置(不入库)
+.claude/settings.local.json
+
+# 构建产物
+dist/
+build/
+*.egg-info/
+
+# 演示环境(含账本与 secret,绝不入库)
+demo/
+
+# 运行时产物
+.tianji/
+.tmp/
+.pt_*/
+.pytest_cache/
+.scratch/notify-state.json
