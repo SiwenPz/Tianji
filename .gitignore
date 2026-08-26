@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 本地环境设置(不入库)
+.claude/settings.local.json
+
+# 构建产物
+dist/
+build/
+*.egg-info/
+
+# 演示环境(含账本与 secret,绝不入库)
+demo/
+
+# 运行时产物
+.tianji/
+.tmp/
+.pt_*/
+.pytest_cache/
+.scratch/notify-state.json
+# pytest 临时 basetemp(测试产物,含沙箱外提权留下的无权限目录,git 不再扫描)
+.scratch/pytest-*/
+
+# 内部设计与过程文档(开源发布不含)
+CONTEXT.md
+docs/adr/
