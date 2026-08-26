@@ -52,35 +52,24 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _transcript_path(session_id: str, shell: str = "claude") -> "Path | None":
-    """按壳类型返回转录文件路径(不解析内容)。
-
-    字节源按壳类型泛化(7.4③):
-      - claude: ~/.claude/projects/*/<session_id>.jsonl
-      - dsh: $DSH_HOME/sessions/*/<session_id>/session.jsonl.zstd(实证布局,
-        zstd 压缩;DSH_HOME 默认 ~/.dsh)
-      - codex: ~/.codex/sessions/**/rollout-<session_id>.jsonl(归票 08)
-    """
+def _transcript_path(session_id: str, shell: str = "claude",
+                     home_dir: "Path | None" = None,
+                     isolated_dir: str = "") -> "Path | None":
+    """按壳条目 transcript 数据定位转录文件(不解析内容);委托 transcript_parser 统一处理。"""
     if not session_id:
         return None
-    if shell == "claude":
-        hits = list(Path.home().glob(f".claude/projects/*/{session_id}.jsonl"))
-        return hits[0] if hits else None
-    # codex / dsh: 委托 transcript_parser 统一处理路径模式
     from .adapters import transcript_parser
-    return transcript_parser.transcript_path(shell, session_id)
+    return transcript_parser.transcript_path(shell, session_id,
+                                             home_dir=home_dir,
+                                             isolated_dir=isolated_dir)
 
 
-def _transcript_bytes(session_id: str, shell: str = "claude") -> int:
-    """档 2 转录文件字节计数(不解析内容,躲 GBK 控制台坑)。
-
-    字节源按壳类型泛化:
-      - claude: ~/.claude/projects/*/<session_id>.jsonl
-      - dsh: $DSH_HOME/sessions/*/<session_id>/session.jsonl.zstd(实证布局,
-        zstd 压缩;DSH_HOME 默认 ~/.dsh)
-      - codex: ~/.codex/sessions/**/rollout-<session_id>.jsonl(归票 08)。
-    """
-    p = _transcript_path(session_id, shell)
+def _transcript_bytes(session_id: str, shell: str = "claude",
+                      home_dir: "Path | None" = None,
+                      isolated_dir: str = "") -> int:
+    """档 2 转录文件字节计数(不解析内容,躲 GBK 控制台坑)。"""
+    p = _transcript_path(session_id, shell, home_dir=home_dir,
+                         isolated_dir=isolated_dir)
     if not p:
         return 0
     try:
@@ -136,6 +125,42 @@ def _check_network(state: dict) -> bool:
     state["offline_last_check"] = now_ts
     state["offline"] = offline
     return offline
+
+
+def _check_tier3_capability(conn, shell: str, pid: int = 0) -> bool:
+    """档 3 进程活性豁免(附录 E.7): 壳条目声明 tier3_process_alive 则调用对应适配器验证。
+
+    不是"声名即豁免"——要和旧代码等价: 模板说支持 tier3 → 调 adapter 实际验证进程;
+    验证通过才豁免钩子失效判定,否则按无 tier3 处理。
+    """
+    # 先读账本壳条目(决定用哪个 adapter);缺则读模板兜底
+    entry = conn.execute(
+        "SELECT value FROM configs WHERE key=?",
+        (f"integration_shell:{shell}",)).fetchone()
+    adapter = None
+    if entry:
+        data = json.loads(entry["value"])
+        if data.get("capabilities", {}).get("tier3_process_alive"):
+            adapter = data.get("adapter")
+    if adapter is None:
+        try:
+            from .adapters.template import get_template
+            tpl = get_template(shell)
+            if not tpl.capabilities.get("tier3_process_alive"):
+                return False
+            adapter = tpl.adapter
+        except KeyError:
+            return False
+    # 按 adapter 调用实际进程验证(codex_exec_alive);缺 adapter 或不支持 → False
+    if not pid or not adapter:
+        return False
+    try:
+        if adapter == "codex":
+            from .adapters.codex_exec import codex_exec_alive
+            return codex_exec_alive(pid)
+    except Exception:
+        pass
+    return False
 
 
 def _unclosed_subagents(conn, worker_id, since_ts):
@@ -289,19 +314,18 @@ def _tick(conn, state: dict):
             "SELECT MAX(ts) AS last_ts, MAX(seq) AS last_seq FROM messages"
             " WHERE type='event' AND sender=?", (worker,)).fetchone()
         event_ts = ev["last_ts"] or r["dcreated"]
-        # 字节活性
+        # 字节活性: 读实例的 shell + isolated_dir 委托 transcript_parser
         reg = conn.execute(
             "SELECT session_id FROM instance_registrations"
             " WHERE instance_name=? AND status='active'"
             " ORDER BY id DESC LIMIT 1", (worker,)).fetchone()
         session_id = reg["session_id"] if reg else ""
-        shell = "claude"
         inst = conn.execute(
-            "SELECT shell FROM instances WHERE name=?",
+            "SELECT shell, isolated_dir FROM instances WHERE name=?",
             (worker,)).fetchone()
-        if inst:
-            shell = inst["shell"]
-        bnow = _transcript_bytes(session_id, shell)
+        shell = inst["shell"] if inst else "claude"
+        iso_dir = (inst["isolated_dir"] or "") if inst else ""
+        bnow = _transcript_bytes(session_id, shell, isolated_dir=iso_dir)
         base = state.setdefault("bytes", {}).get(worker, (0, r["dcreated"]))
         last_byte_ts = base[1] if bnow > base[0] else base[1]
         if bnow > base[0]:
@@ -510,28 +534,22 @@ def _tick(conn, state: dict):
         size = hb.get(r["instance_name"])
         shell = "claude"
         inst = conn.execute(
-            "SELECT shell FROM instances WHERE name=?",
+            "SELECT shell, isolated_dir FROM instances WHERE name=?",
             (r["instance_name"],)).fetchone()
         if inst:
             shell = inst["shell"]
-        cur = _transcript_bytes(r["session_id"], shell)
+        iso_dir = (inst["isolated_dir"] or "") if inst else ""
+        cur = _transcript_bytes(r["session_id"], shell,
+                                isolated_dir=iso_dir)
         if ev > prev_ev:
             state["last_event_seq"][r["instance_name"]] = ev
             hb[r["instance_name"]] = cur
             state.get("hook_suspect", {}).pop(r["instance_name"], None)
         elif size is None:
-            # 首采样只建基线: 监控器无状态重启后,存量转录不算"增长"
-            # (2026-08 演示踩坑: 重启后对空闲老会话误报钩子失效)
             hb[r["instance_name"]] = cur
         elif cur > size:
-            # 档 3 兜底(票 08): codex exec 进程仍存活则豁免(活性退到档 3,不误报)
-            tier3_alive = False
-            if shell == "codex" and r["pid"]:
-                try:
-                    from .adapters.codex_exec import codex_exec_alive
-                    tier3_alive = codex_exec_alive(r["pid"])
-                except Exception:
-                    pass
+            # 档 3 兜底: 壳条目声明 tier3_process_alive 则豁免(不再写死 codex 壳名)
+            tier3_alive = _check_tier3_capability(conn, shell, pid=r["pid"])
             if tier3_alive:
                 hb[r["instance_name"]] = cur
                 continue

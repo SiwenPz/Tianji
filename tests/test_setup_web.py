@@ -329,10 +329,9 @@ def test_claude_settings_has_explicit_ctrl_session(home):
     """claude settings 显式声明 ctrl_session: stream-json(不依赖旧账本兜底)。"""
     from tianji import wizard as wz
     import os
-    wz._write_claude_settings(
+    wz._write_controller_settings(
         home_p=home, home=str(home), shell="claude",
-        secret="s", provider=None, ready=True, cards=None,
-        intro="", role_text="")
+        secret="s")
     doc = json.loads((home / "settings-controller.json").read_text(
         encoding="utf-8"))
     assert "ctrl_session" in doc
@@ -341,12 +340,11 @@ def test_claude_settings_has_explicit_ctrl_session(home):
 
 
 def test_generic_settings_carries_ctrl_session_when_present(home):
-    """generic 分支: 壳条目含 ctrl_session → 写出带块的 settings。"""
+    """kimi settings: ctrl_session 块(acp/启动器/data_root_env/角色话术)。"""
     from tianji import wizard as wz
-    # kimi 在 SHELL_ENTRY_DEFAULTS 里有 ctrl_session,走 generic 分支写
-    wz._write_generic_settings(
+    wz._write_controller_settings(
         home_p=home, home=str(home), shell="kimi",
-        secret="s", role_text="角色")
+        secret="s")
     doc = json.loads((home / "settings-controller.json").read_text(
         encoding="utf-8"))
     assert doc["ctrl_session"]["protocol"] == "acp"

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Callable
 
 from . import integrations
 
@@ -99,13 +100,42 @@ def _read_key(key_ref: str) -> str:
 
 # ---------------------------------------------------------------- renderers
 
-RENDERERS = {}
+RENDERERS: dict[str, Callable] = {}
 
 
-def renderer(*shell_names):
-    """壳渲染器注册器: 一个实现可挂多个壳名(同形态壳的明确迁移映射)。"""
+def _shell_to_morph(shell: str, conn=None) -> str | None:
+    """壳名→morph 名(读壳条目 renderer 字段;缺则内置模板兜底)。"""
+    if conn is None:
+        from .db import connect
+        conn = connect()
+    row = conn.execute(
+        "SELECT value FROM configs WHERE key=?",
+        (f"integration_shell:{shell}",)).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT value FROM configs WHERE key=?",
+            (f"shell:{shell}",)).fetchone()
+    if row:
+        try:
+            return json.loads(row["value"]).get("renderer")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    # 内置模板兜底
+    try:
+        from .adapters.template import _BUILTIN
+        return _BUILTIN.get(shell, {}).get("renderer")
+    except ImportError:
+        pass
+    return None
+
+
+def renderer(*morph_names):
+    """壳渲染器注册器: 一个实现可挂多个 morph 名(同形态壳的明确迁移映射)。
+
+    新增壳=在壳条目声明 renderer=morph 名,通用控制流自动路由。
+    """
     def deco(fn):
-        for n in shell_names:
+        for n in morph_names:
             RENDERERS[n] = fn
         return fn
     return deco
@@ -145,12 +175,9 @@ def _render_codex(ctx):
     return launch_cmd, [str(cfg)]
 
 
-@renderer("kimi", "atomcode", "cline", "dsh")
+@renderer("config_binding")
 def _render_config_binding(ctx):
-    """壳内配置型(kimi/atomcode/cline/dsh 同形态迁移映射): key 留各壳
-    配置域,启动器=调壳的薄命令。数据根隔离只在壳条目显式声明
-    worker_data_root_env 时注入(ctrl_session 的 data_root_env 是总控
-    会话专用,不顺手继承——隔离根内要重新登录,不能悄悄改变工人行为)。"""
+    """壳内配置型(config_binding morph): key 留各壳配置域,启动器=调壳的薄命令。"""
     entry = ctx.get("entry") or {}
     env_name = entry.get("worker_data_root_env") or ""
     if env_name and ctx["isolated_dir"]:
@@ -161,10 +188,13 @@ def _render_config_binding(ctx):
 
 def render(conn, shell, instance="", model="", key_name="", isolated_dir="",
            entry=None):
-    """通用装配控制流: 壳名→renderer→(launch_cmd, artifacts)。零壳名分支。"""
-    fn = RENDERERS.get(shell)
+    """通用装配控制流: 壳名→morph→renderer→(launch_cmd, artifacts)。零壳名分支。"""
+    morph = _shell_to_morph(shell, conn=conn)
+    if morph is None:
+        raise ValueError(f"壳 {shell} 无 renderer(新壳先登记 renderer+壳条目)")
+    fn = RENDERERS.get(morph)
     if fn is None:
-        raise ValueError(f"壳 {shell} 无渲染器(新壳先登记 renderer+壳条目)")
+        raise ValueError(f"壳 {shell} 的 morph={morph} 无渲染器实现")
     _, _, key_ref, base_url = resolve_credential(conn, key_name)
     if entry is None:
         row = conn.execute("SELECT value FROM configs WHERE key=?",

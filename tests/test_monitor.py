@@ -213,7 +213,8 @@ def test_hook_degraded_first_sample_baseline(conn, controller, worker, monkeypat
     conn.execute("UPDATE instance_registrations SET pid=? WHERE status='active'",
                  (os.getpid(),))
     sizes = iter([100, 100, 150, 150, 150, 160, 170])
-    monkeypatch.setattr(mon, "_transcript_bytes", lambda sid, shell="claude": next(sizes))
+    monkeypatch.setattr(mon, "_transcript_bytes",
+                        lambda sid, shell="claude", **kw: next(sizes))
     state = {}
     _tick(conn, state)   # 首采样: 建基线,不报
     _tick(conn, state)   # 不涨: 不报

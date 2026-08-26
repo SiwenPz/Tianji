@@ -641,32 +641,18 @@ async def api_setup_controller(req: Request):
             card.update(key_value=body["key"], base_url=body["base_url"].strip(),
                         key_name=(body.get("key_name") or "").strip() or "主key")
         res = wizard.land_cards(conn, home_p, ident, [card])
-        settings = None
         secret = (home_p / "ctrl-secret.txt").read_text(
             encoding="utf-8").strip()
-        if shell == "claude":
-            provider = ({"key_value": card["key_value"],
-                         "base_url": card["base_url"],
-                         "model": card["model"]}
-                        if card["source"] == "key" else None)
-            settings = wizard._write_controller_settings(
-                home_p, str(home_p), shell, secret,
-                provider=provider, ready=True)
-        elif shell == "kimi":
-            provider = ({"key_value": card["key_value"],
-                         "base_url": card["base_url"],
-                         "model": card["model"],
-                         "key_name": card.get("key_name", "主key")}
-                        if card["source"] == "key" else None)
-            settings = wizard._write_controller_settings(
-                home_p, str(home_p), shell, secret,
-                provider=provider, ready=True)
-        else:
-            # 第三方壳(已过 ctrl_session 守卫): 走 generic 数据驱动分支。
-            # 注意: generic 目前不接外接 key(provider 不传导),
-            # 外接 key 的第三方壳支持是后续票的事。
-            settings = wizard._write_controller_settings(
-                home_p, str(home_p), shell, secret, ready=True)
+        # provider 信息统一构造;_write_controller_settings 读壳条目 provider_env
+        # 决定凭据映射位置(settings_env / process_env)
+        provider = None
+        if card["source"] == "key":
+            provider = {"key_value": card["key_value"],
+                        "base_url": card["base_url"],
+                        "model": card["model"]}
+        settings = wizard._write_controller_settings(
+            home_p, str(home_p), shell, secret,
+            provider=provider, ready=True)
         return {"landed": res["landed"], "settings": settings,
                 "state": _setup_state(conn)}
     finally:

@@ -90,7 +90,7 @@ def test_real_command_composition(tmp_path, monkeypatch):
 
     b = ClaudeStreamBackend(
         home=tmp_path, launch=["claude"],
-        data_root_env=None, key_env_style="cli-env",
+        data_root_env=None, provider_env={},
     )
     b.start(tmp_path)
     cmd = captured["cmd"]
@@ -214,7 +214,7 @@ def test_model_pin_explicit(tmp_path, monkeypatch):
 
     b = ClaudeStreamBackend(
         home=tmp_path, launch=["claude"],
-        data_root_env=None, key_env_style="cli-env",
+        data_root_env=None, provider_env={},
         model="deepseek-v4-flash")
     b.start(tmp_path)
     cmd = captured["cmd"]
@@ -223,7 +223,7 @@ def test_model_pin_explicit(tmp_path, monkeypatch):
     captured["cmd"] = None
     b2 = ClaudeStreamBackend(
         home=tmp_path, launch=["claude"],
-        data_root_env=None, key_env_style="cli-env")
+        data_root_env=None, provider_env={},)
     b2.start(tmp_path)
     assert "--model" not in captured["cmd"]
 
@@ -239,7 +239,7 @@ def test_resume_flag_composed(tmp_path, monkeypatch):
     _persist_session(tmp_path, "sess-123")
     b = ClaudeStreamBackend(
         home=tmp_path, launch=["claude"],
-        data_root_env=None, key_env_style="cli-env")
+        data_root_env=None, provider_env={},)
     b.start(tmp_path)
     cmd = captured["cmd"]
     assert cmd[cmd.index("--resume") + 1] == "sess-123"
@@ -249,7 +249,7 @@ def test_resume_flag_composed(tmp_path, monkeypatch):
     captured["cmd"] = None
     b2 = ClaudeStreamBackend(
         home=tmp_path, launch=["claude"],
-        data_root_env=None, key_env_style="cli-env")
+        data_root_env=None, provider_env={},)
     b2.start(tmp_path)
     assert "--resume" not in captured["cmd"]
 
@@ -297,7 +297,7 @@ def test_resume_fail_clears_and_retries(tmp_path, monkeypatch):
 
     b = ClaudeStreamBackend(
         home=tmp_path, launch=["claude"],
-        data_root_env=None, key_env_style="cli-env")
+        data_root_env=None, provider_env={},)
     b.start(tmp_path)
     assert "--resume" in captured["cmd"]  # 首起带 resume(盘上有 id)
     b._started_at = _t.monotonic() - 1.0  # 模拟年轻死亡(起后 5s 内)

@@ -50,7 +50,15 @@ def _write_kimi_settings(home: Path):
         "ctrl_session": {
             "protocol": "acp",
             "launch": ["kimi", "acp"],
-            "key_env_style": "kimi-model",
+            "provider_env": {
+                "target": "process_env",
+                "map": {
+                    "KIMI_MODEL_NAME": "{model}",
+                    "KIMI_MODEL_API_KEY": "{key}",
+                    "KIMI_MODEL_BASE_URL": "{base_url}",
+                    "KIMI_MODEL_PROVIDER_TYPE": "{protocol}",
+                },
+            },
             "key_ref": "",
             "model": "kimi-test",
             "base_url": "https://api.test",
@@ -70,7 +78,10 @@ def _write_acp_settings(home: Path, shell: str = "fake-acp"):
         "ctrl_session": {
             "protocol": "acp",
             "launch": [shell, "acp"],
-            "key_env_style": "fake-model",
+            "provider_env": {
+                "target": "process_env",
+                "map": {"MAP_FOO": "{model}"},
+            },
             "key_ref": "",
             "model": "fake-test",
             "base_url": "https://api.test",
@@ -100,7 +111,7 @@ class TestBackendFromConfig:
         assert isinstance(b, ClaudeStreamBackend)
         assert b.home == fake_home
         assert b.launch == ["claude"]
-        assert b.key_env_style == "cli-env"
+        assert b.provider_env == {}
 
     def test_kimi_settings_produces_acp_backend(self, fake_home):
         _write_kimi_settings(fake_home)
@@ -109,7 +120,12 @@ class TestBackendFromConfig:
         assert isinstance(b, ACPBackend)
         assert b.home == fake_home
         assert b.launch == ["kimi", "acp"]
-        assert b.key_env_style == "kimi-model"
+        assert b.provider_env == {"target": "process_env", "map": {
+            "KIMI_MODEL_API_KEY": "{key}",
+            "KIMI_MODEL_NAME": "{model}",
+            "KIMI_MODEL_BASE_URL": "{base_url}",
+            "KIMI_MODEL_PROVIDER_TYPE": "{protocol}",
+        }}
         assert b._key_ref == ""
         assert b._model == "kimi-test"
         assert b._base_url == "https://api.test"
@@ -241,23 +257,23 @@ class TestCtrlDispatch:
             wa._ctrl_session.close()
 
 
-class TestWizardKimiSettings:
-    def test_wizard_kimi_settings_has_launch_field(self, fake_home):
-        """wizard._write_kimi_settings 写出的 ctrl_session 块必须含 launch 字段。"""
+class TestWizardControllerSettings:
+    def test_kimi_settings_has_ctrl_session(self, fake_home):
+        """wizard._write_controller_settings 为 kimi 写出 ctrl_session 块含 launch。"""
         from tianji import wizard
         sub = fake_home / "sub_home"
         sub.mkdir(parents=True, exist_ok=True)
         keys_dir = sub / "keys"
         keys_dir.mkdir(parents=True, exist_ok=True)
-        wizard._write_kimi_settings(
-            home_p=sub, home=str(sub), shell="bash", secret="s",
+        wizard._write_controller_settings(
+            home_p=sub, home=str(sub), shell="kimi", secret="s",
             provider={"model": "m", "base_url": "https://x", "key_name": "k"},
-            role_text="角色",
-        )
+            ready=True, cards=[])
         doc = json.loads((sub / "settings-controller.json").read_text(encoding="utf-8"))
         cs = doc["ctrl_session"]
         assert cs["protocol"] == "acp"
         assert cs["launch"] == ["kimi", "acp"]
+        assert "provider_env" in cs
 
 
 class TestPluginCtrlSession:
@@ -271,7 +287,10 @@ class TestPluginCtrlSession:
             "isolated_dir_mode": "workdir-grouping",
             "ctrl_session": {"protocol": "acp", "launch": ["fake-acp", "acp"],
                              "data_root_env": "FAKE_HOME",
-                             "key_env_style": "fake-model"},
+                             "provider_env": {
+                                 "target": "process_env",
+                                 "map": {"MAP_FOO": "{model}"},
+                             }},
         }
         wizard.SHELL_ENTRY_DEFAULTS["fake-acp"] = fake_entry
         try:
@@ -282,16 +301,19 @@ class TestPluginCtrlSession:
             # launch 来自 settings 文件(条目数据优先,不硬编码)
             assert b.launch == ["fake-acp", "acp"]
             assert b.data_root_env == "FAKE_HOME"
-            assert b.key_env_style == "fake-model"
+            assert b.provider_env == {"target": "process_env", "map": {
+                "MAP_FOO": "{model}",
+            }}
         finally:
             wizard.SHELL_ENTRY_DEFAULTS.pop("fake-acp", None)
 
-    def test_shell_without_ctrl_session_no_launch_cs_block(self, fake_home):
-        """无 ctrl_session 的壳(generic 分支) → settings 不含 ctrl_session 块。"""
+    def test_shell_without_ctrl_session_uses_append_system_prompt(self, fake_home):
+        """无 ctrl_session 的壳(codex) → settings 用 appendSystemPrompt,不含 ctrl_session 块。"""
         from tianji import wizard
-        wizard._write_generic_settings(
+        wizard._write_controller_settings(
             home_p=fake_home, home=str(fake_home), shell="codex",
-            secret="s", role_text="角色")
+            secret="s")
         doc = json.loads((fake_home / "settings-controller.json").read_text(
             encoding="utf-8"))
         assert "ctrl_session" not in doc
+        assert "appendSystemPrompt" in doc

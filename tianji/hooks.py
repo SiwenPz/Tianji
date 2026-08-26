@@ -21,7 +21,7 @@ HOOK_TEMPLATE_VERSION = "v1"
 
 _FP_PREFIX = "# tianji-hook-fingerprint:"
 
-_STATUSLINE_PY = '''"""天机 statusline 上报脚本(14.1①): claude 状态栏调用,上下文占用%上报账本。"""
+_STATUSLINE_PY = '''"""天机 statusline 上报脚本(14.1①): 壳状态栏调用,上下文占用%上报账本。"""
 
 import json
 import os
@@ -60,7 +60,7 @@ def _fp(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def _artifacts(inst) -> list:
+def _artifacts(inst, conn=None) -> list:
     """按壳模板+实例参数渲染生成物(17.1;安装位置按各壳机制,隔离目录内)。"""
     shell = inst["shell"]
     iso = inst["isolated_dir"]
@@ -68,16 +68,20 @@ def _artifacts(inst) -> list:
         return []
     base = Path(iso)
     arts = []
-    # ① 适配器脚本副本(拷贝副本最稳、删了能补、与壳加载零摩擦)
-    adapter = Path(__file__).parent / "adapters" / f"{shell}_hook.py"
-    if adapter.is_file():
-        body = adapter.read_text(encoding="utf-8")
-        arts.append({"name": "adapter", "path": base / f"tianji_{shell}_hook.py",
+    # ① 适配器脚本副本(6.2 通用 runner + 壳名常量;不再要求 {shell}_hook.py 文件)
+    # 工序: 从 runner.py 读取通用逻辑 → 内联壳名 → 写隔离目录
+    runner_src = Path(__file__).parent / "adapters" / "runner.py"
+    if runner_src.is_file():
+        body = runner_src.read_text(encoding="utf-8")
+        # 把 runner 的 TIANJI_SHELL fallback 替换为实例壳名(实例级固化)
+        body = body.replace(
+            'os.environ.get("TIANJI_SHELL", "claude")',
+            f'"{shell}"')
+        arts.append({"name": "adapter",
+                     "path": base / f"tianji_{shell}_hook.py",
                      "kind": "py", "body": body})
-    # ② statusline 脚本(claude 壳,14.1① 装钩子时一并装)
-    if shell == "claude":
-        arts.append({"name": "statusline", "path": base / "tianji_statusline.py",
-                     "kind": "py", "body": _STATUSLINE_PY})
+    # ② statusline 脚本(data-driven: 读壳条目 capabilities.statusline)
+    _maybe_statusline(shell, base, arts, conn=conn)
     # ③ 钩子清单(JSON 配置,合并进各壳配置域)
     arts.append({"name": "hooks-manifest",
                  "path": base / "tianji-hooks.json",
@@ -85,6 +89,40 @@ def _artifacts(inst) -> list:
                  "body": json.dumps(_HOOKS_MANIFEST, ensure_ascii=False,
                                     indent=1)})
     return arts
+
+
+def _maybe_statusline(shell: str, base: Path, arts: list, conn=None):
+    """statusline 脚本: 壳条目 capabilities.statusline.enabled 控制是否注册。
+
+    不再按壳名字面量硬编码(Block 10: claude 特判 → 注册表能力声明)。
+    """
+    enabled = False
+    try:
+        from .adapters.template import get_template
+        try:
+            caps = get_template(shell).capabilities or {}
+            sl = caps.get("statusline") or {}
+            enabled = bool(sl.get("enabled"))
+        except KeyError:
+            pass
+    except ImportError:
+        pass
+    if not enabled and conn is not None:
+        # 也检查集成注册表(壳条目不完整时回退)
+        try:
+            row = conn.execute(
+                "SELECT value FROM configs WHERE key=?",
+                (f"integration_shell:{shell}",)).fetchone()
+            if row:
+                data = json.loads(row["value"])
+                caps = (data.get("capabilities") or {})
+                enabled = bool((caps.get("statusline") or {}).get("enabled"))
+        except Exception:
+            pass
+    if enabled:
+        arts.append({"name": "statusline",
+                     "path": base / "tianji_statusline.py",
+                     "kind": "py", "body": _STATUSLINE_PY})
 
 
 def _render(art: dict) -> str:
@@ -105,7 +143,7 @@ def install_instance(conn, name: str) -> dict:
         raise KeyError(f"实例 {name} 未注册")
     written = []
     manifest = []
-    for art in _artifacts(inst):
+    for art in _artifacts(inst, conn=conn):
         content = _render(art)
         art["path"].parent.mkdir(parents=True, exist_ok=True)
         art["path"].write_text(content, encoding="utf-8")

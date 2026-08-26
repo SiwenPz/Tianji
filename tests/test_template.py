@@ -64,10 +64,14 @@ class TestTemplateRegistry:
                 "interrupt_on_empty": False,
             },
             "transcript": {
-                "path": "claude",
-                "glob": None,
-                "session_id_is_filename": False,
+                "roots": [{"type": "home", "subpath": ".mycli"}],
+                "glob": ["sessions/{session_id}.jsonl"],
+                "source_type": "jsonl",
+                "authoritative_source": None,
             },
+            "renderer": "config_binding",
+            "binding": "config",
+            "protocols": ["openai"],
         })
         from tianji.adapters import template as tpl_mod
         tpl_mod.register(custom)
@@ -222,11 +226,12 @@ class TestTranslate:
 
 class TestCompletion:
     def test_codex_stop_is_completion(self):
+        """附录 E.7: codex 的 stop_is_completion=False(死配置已清,6.4)。"""
         tpl = get_template("codex")
-        assert is_completion_event(tpl, "stop") is True
+        assert is_completion_event(tpl, "stop") is False
         assert is_completion_event(tpl, "session_end") is True
 
-    def test_codex_other_not_completion(self):
+    def test_codex_stop_not_completion(self):
         tpl = get_template("codex")
         assert is_completion_event(tpl, "session_start") is False
         assert is_completion_event(tpl, "pre_tool_use") is False
@@ -277,10 +282,13 @@ class TestTemplateFields:
         assert tpl.thinking_level_map is None
 
     def test_codex_transcript_config(self):
+        """附录 E.3: transcript 新格式 = roots + glob + source_type + authoritative_source"""
         tpl = get_template("codex")
-        assert tpl.transcript["path"] == "codex"
-        assert "rollout-{session_id}" in tpl.transcript["glob"]
-        assert tpl.transcript["session_id_is_filename"] is True
+        assert tpl.transcript["source_type"] == "jsonl"
+        assert "rollout-{session_id}" in tpl.transcript["glob"][0]
+        assert tpl.transcript["authoritative_source"] is None
+        assert tpl.transcript["roots"][0]["type"] == "home"
+        assert tpl.transcript["roots"][0]["subpath"] == ".codex"
 
     def test_dsh_sandbox_allowlist(self):
         tpl = get_template("dsh")
@@ -288,32 +296,34 @@ class TestTemplateFields:
 
     def test_dsh_transcript_config(self):
         tpl = get_template("dsh")
-        assert tpl.transcript["path"] == "dsh"
-        assert "session.jsonl" in tpl.transcript["glob"]
+        assert tpl.transcript["source_type"] == "zstd"
+        assert "session.jsonl" in tpl.transcript["glob"][1]
+        assert tpl.transcript["roots"][0]["type"] == "env"
+        assert tpl.transcript["roots"][0]["name"] == "DSH_HOME"
 
     def test_kimi_template_fields(self):
         tpl = get_template("kimi")
-        assert tpl.transcript["path"] == "kimi"
+        assert "wire-{session_id}.jsonl" in tpl.transcript["glob"]
         assert tpl.transcript["authoritative_source"] == "wire"
-        assert tpl.permission_slot["type"] == "rule_table"
+        assert tpl.permission_slot["mechanism"] == "rule_table"
 
     def test_atomcode_template_fields(self):
         tpl = get_template("atomcode")
-        assert tpl.transcript["path"] == "atomcode"
-        assert "{uuid}.jsonl" in tpl.transcript["glob"]
+        assert "{session_id}.jsonl" in tpl.transcript["glob"][0]
+        assert tpl.transcript["source_type"] == "jsonl"
 
     def test_cline_template_fields(self):
         tpl = get_template("cline")
-        assert tpl.transcript["path"] == "cline"
+        assert "sessions.db" in tpl.transcript["glob"][0]
         assert tpl.transcript["source_type"] == "sqlite"
-        assert tpl.permission_slot["type"] == "auto_approve"
+        assert tpl.permission_slot["mechanism"] == "auto_approve"
 
 
 class TestResumeCommand:
     """7.5 续推通道: 壳模板续跑翻译(成功翻译/不支持 fail-loud)。"""
 
     def test_resume_field_on_supported_shells(self):
-        """三壳模板定义了 resume 续跑原语,其余壳无。"""
+        """有 resume 续跑原语的壳(6.3/7.5);codex/kimi/cline 暂无。"""
         assert get_template("claude").resume is not None
         assert get_template("dsh").resume is not None
         assert get_template("atomcode").resume is not None
