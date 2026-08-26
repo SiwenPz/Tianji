@@ -196,8 +196,8 @@ key_env_style 迁移：cli-env→target=settings_env；kimi-model→target=proce
 ## 测试基线
 
 - 命令：`python -m pytest tests -q`
-- 你的环境 = Windows + Python 3.12（实测基准），**508 条全绿**，收工时一条不许挂。
-- 开工前先跑一遍确认全绿；不绿先修环境，别带病开工。
+- 你的环境 = Windows + Python 3.12（实测基准）。
+- 开工先跑一遍全量，**以实际结果为基线**：全绿才许动手，不绿先修环境；收工时不许比开工基线多挂一条（主线随票合并增长，别认死数字）。
 
 ## Git 交活流程
 

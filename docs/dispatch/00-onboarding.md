@@ -4,20 +4,27 @@
 
 天机是一个管 AI 编程助手的协作框架：账本(SQLite)记角色/实例/任务/审计，把不同助手壳和模型供应商按稳定组合拉进"派活→监控→验收→返工"流水线，自举开发中。
 
-## 第一步：切到你的票分支（不 clone！）
+## 第一步：拿到仓库，切到你的票分支
 
-你的工作目录已经指向本地的 Tianji 项目仓库，**不要执行 git clone**：
+**情况 A——全新机器（当前目录还不是 Tianji 仓库）**：clone 一次，进目录：
 
 ```bash
-# 0. 如果之前 clone 出了多余的嵌套目录（比如目录下又多了个 Tianji/），删掉它，回原项目目录
-# 1. 确认远端指向正确（应为 github.com/SiwenPz/Tianji.git）
-git remote -v
-# 2. 拉取远端最新
+git clone git@github.com:SiwenPz/Tianji.git
+cd Tianji
+```
+
+**情况 B——当前目录已经是 Tianji 仓库**：**不要再 clone**（目录里又套一层 Tianji/ 是错的，删掉套出来的目录、回项目根）。确认远端、拉最新：
+
+```bash
+git remote -v    # 应指向 github.com/SiwenPz/Tianji.git
 git fetch origin
-# 3. 切到你的票分支（-B 强制对齐远端，就算本地残留同名旧分支也不怕）
-git checkout -B <你的票分支名> origin/<你的票分支名>
-# 4. 确认人在票分支上（应显示 ticket-NN-xxx）
-git status
+```
+
+两种情况最后都切到你的票分支：
+
+```bash
+git checkout -B <你的票分支名> origin/<你的票分支名>   # -B 强制对齐远端，本地残留同名旧分支也不怕
+git status                                           # 确认人在票分支上（应显示 ticket-NN-xxx）
 ```
 
 提示：若 checkout 报"本地改动会被覆盖"，先 `git stash` 暂存再切，别强丢现场。
@@ -29,7 +36,8 @@ pip install -e .          # 装过会秒过，可跳过
 python -m pytest tests -q # 全量测试
 ```
 
-- 基准环境 = Windows + Python 3.12，**508 条全绿**。
+- 基准环境 = Windows + Python 3.12。
+- **以开工实测为基线**：跑一遍全量，全绿才许动手；收工时不许比这个基线多挂一条。主线随票合并测试总数会变，别认死数字。
 - 不绿先修环境，别带病开工。
 
 ## 第三步：读文档（按序）
