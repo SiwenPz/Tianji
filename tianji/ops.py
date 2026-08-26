@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 import sqlite3
 import time
@@ -32,9 +33,10 @@ class SpawnPacer:
     一个 Python 进程,模块级状态随进程死(审核 2026-08-24 技术修正),不挂;
     只有监控器这类常驻进程启动时 PACER.enabled=True,内存节奏才有效。
     """
-    def __init__(self, base: float = 2.0, cap: float = 60.0):
+    def __init__(self, base: float = 2.0, cap: float = 60.0, jitter: float = 0.5):
         self.base = base
         self.cap = cap
+        self.jitter = jitter
         self._interval = base
         self._ok_streak = 0
         self._last_gate = 0.0
@@ -46,7 +48,7 @@ class SpawnPacer:
             return
         wait = self._last_gate + self._interval - time.monotonic()
         if wait > 0:
-            time.sleep(wait)
+            time.sleep(wait * random.uniform(1 - self.jitter, 1 + self.jitter))
         self._last_gate = time.monotonic()
 
     def on_rate_limited(self) -> None:
@@ -777,6 +779,7 @@ def _reschedule(conn, task_id, worker_id, reason, skip_score=False):
     # PACER.enabled 默认关;重派风暴本来就从监控器来——审核 2026-08-24)
     PACER.base = float(_config(conn, "pacer_base_sec") or PACER.base)
     PACER.cap = float(_config(conn, "pacer_cap_sec") or PACER.cap)
+    PACER.jitter = float(_config(conn, "pacer_jitter") or PACER.jitter)
     PACER.gate()
     if reason and PACER.hint_is_rate_limit(reason):
         PACER.on_rate_limited()

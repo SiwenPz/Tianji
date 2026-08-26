@@ -558,7 +558,7 @@ class TestSpawnPacer:
         slept = []
         monkeypatch.setattr("tianji.ops.time.sleep",
                             lambda s: slept.append(s))
-        p = ops.SpawnPacer(base=10.0)
+        p = ops.SpawnPacer(base=10.0, jitter=0)
         p.gate()
         assert slept == []
 
@@ -567,7 +567,7 @@ class TestSpawnPacer:
         slept = []
         monkeypatch.setattr("tianji.ops.time.sleep",
                             lambda s: slept.append(s))
-        p = ops.SpawnPacer(base=10.0)
+        p = ops.SpawnPacer(base=10.0, jitter=0)
         p.enabled = True
         p.gate()
         assert slept == []
@@ -613,3 +613,19 @@ class TestSpawnPacer:
         assert pacer._interval == 2.0  # 正常原因不翻倍
         ops._reschedule(conn, tid, worker["worker_id"], "429 限流")
         assert pacer._interval == 4.0  # 限流原因翻倍
+
+    def test_jitter_range(self, monkeypatch):
+        """抖动范围: sleep 时长 ∈ [0.5×interval, 1.5×interval]。"""
+        slept = []
+        monkeypatch.setattr("tianji.ops.time.sleep",
+                            lambda s: slept.append(s))
+        p = ops.SpawnPacer(base=2.0)
+        p.enabled = True
+        p.gate()
+        p.gate()
+        assert len(slept) == 1
+        assert 1.0 <= slept[0] <= 3.0  # 0.5*2.0 ≤ wait ≤ 1.5*2.0
+
+    def test_default_jitter(self):
+        """模块级 PACER.jitter 默认 0.5。"""
+        assert ops.PACER.jitter == 0.5
