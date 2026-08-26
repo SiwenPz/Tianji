@@ -27,6 +27,15 @@ class Template:
     completion: dict = field(default_factory=dict)
     permission_slot: dict | None = None
     resume: dict | None = None
+    renderer: str = ""
+    binding: str = ""
+    protocols: list = field(default_factory=list)
+    isolated_dir_mode: str = ""
+    adapter: dict = field(default_factory=dict)
+    hooks: dict = field(default_factory=dict)
+    capabilities: dict = field(default_factory=dict)
+    controller_settings: dict = field(default_factory=dict)
+    provider_env: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Template":
@@ -44,6 +53,15 @@ class Template:
             completion=data.get("completion") or {},
             permission_slot=data.get("permission_slot"),
             resume=data.get("resume"),
+            renderer=data.get("renderer", ""),
+            binding=data.get("binding", ""),
+            protocols=data.get("protocols", []),
+            isolated_dir_mode=data.get("isolated_dir_mode", ""),
+            adapter=data.get("adapter") or {},
+            hooks=data.get("hooks") or {},
+            capabilities=data.get("capabilities") or {},
+            controller_settings=data.get("controller_settings") or {},
+            provider_env=data.get("provider_env") or {},
         )
 
 
@@ -76,20 +94,76 @@ TEMPLATE_CLAUDE: dict = {
         "interrupt_on_empty": True,
     },
     "thinking_level_map": None,
+    "renderer": "claude",
+    "binding": "env",
+    "protocols": ["anthropic"],
+    "isolated_dir_mode": "settings-file",
     "transcript": {
-        "path": "claude",
-        "glob": None,
-        "session_id_is_filename": False,
+        "roots": [{"type": "home", "subpath": ".claude"}],
+        "glob": ["projects/*/{session_id}.jsonl"],
+        "source_type": "jsonl",
+        "authoritative_source": None,
     },
     "sandbox_allowlist": [],
     "completion": {
         "session_end_event": "session_end",
         "stop_is_completion": False,
     },
-    # 7.5 续推通道: 无头续跑原语(claude -c -p 实证: -c 续最近会话 + -p 无头打印)
     "resume": {
         "cmd": "claude -c -p",
         "prompt": "继续任务书: {task_path}",
+    },
+    # 6.6 权限位: 钩子 allow 类(claude/codex/atomcode)放行三路之一
+    "permission_slot": {
+        "mechanism": "hook_allow",
+        "hook_response_format": "cc",
+        "hook_action": "deny",
+        "headless": {"policy": "deny", "fallback": "hook_deny"},
+    },
+    # 总控 settings 写入
+    "controller_settings": {
+        "role_text_target": "appendSystemPrompt",
+        "permissions": {"allow": [
+            "Bash(python -m tianji:*)",
+            "Bash(python -m tianji)",
+            "Bash(tianji:*)",
+        ]},
+        "ctrl_session": {
+            "protocol": "stream-json",
+            "launch": ["claude"],
+        },
+    },
+    "provider_env": {
+        "target": "settings_env",
+        "map": {
+            "ANTHROPIC_AUTH_TOKEN": "{key}",
+            "ANTHROPIC_BASE_URL": "{base_url}",
+            "ANTHROPIC_MODEL": "{model}",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "{model}",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "{model}",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "{model}",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL": "{model}",
+        },
+    },
+    # 适配器
+    "adapter": {
+        "template": "generic",
+        "output_file": "tianji_claude_hook.py",
+    },
+    # 钩子清单
+    "hooks": {
+        "manifest_merge": "deep_merge_managed",
+        "managed_keys": ["tianji"],
+    },
+    # 能力声明
+    "capabilities": {
+        "statusline": {
+            "enabled": True,
+            "template": "claude_statusline",
+            "output_file": "tianji_statusline.py",
+        },
+        "quota_sources": ["statusline", "transcript", "ccswitch"],
+        "tier3_process_alive": False,
     },
 }
 
@@ -129,15 +203,55 @@ TEMPLATE_CODEX: dict = {
         "medium": {"config_key": "model_reasoning_effort", "value": "medium"},
         "high": {"config_key": "model_reasoning_effort", "value": "high"},
     },
+    "renderer": "codex",
+    "binding": "env",
+    "protocols": ["openai"],
+    "isolated_dir_mode": "codex-home",
     "transcript": {
-        "path": "codex",
-        "glob": ".codex/sessions/**/rollout-{session_id}.jsonl",
-        "session_id_is_filename": True,
+        "roots": [{"type": "home", "subpath": ".codex"}],
+        "glob": ["sessions/**/rollout-{session_id}.jsonl"],
+        "source_type": "jsonl",
+        "authoritative_source": None,
     },
     "sandbox_allowlist": [],
     "completion": {
         "session_end_event": "session_end",
-        "stop_is_completion": True,
+        "stop_is_completion": False,
+    },
+    # 无头续跑原语暂未实证,codex 不支持无头续跑(返回 supported=False)
+    # 6.6 权限位: 钩子 allow 类(codex/atomcode)放行三路之一
+    "permission_slot": {
+        "mechanism": "hook_allow",
+        "hook_response_format": "bare",
+        "hook_action": "deny",
+        "headless": {"policy": "deny", "fallback": "hook_deny"},
+    },
+    # 总控 settings 写入: codex 无 ctrl_session(走 env)
+    "controller_settings": {
+        "role_text_target": "ctrl_session",
+        "permissions": {},
+    },
+    "provider_env": {
+        "target": "process_env",
+        "map": {
+            "CODEX_WIZARD_KEY": "${key}",
+        },
+    },
+    # 适配器
+    "adapter": {
+        "template": "generic",
+        "output_file": "tianji_codex_hook.py",
+    },
+    # 钩子清单
+    "hooks": {
+        "manifest_merge": "deep_merge_managed",
+        "managed_keys": ["tianji"],
+    },
+    # 能力声明
+    "capabilities": {
+        "statusline": {"enabled": False},
+        "quota_sources": ["transcript"],
+        "tier3_process_alive": True,
     },
 }
 
@@ -174,23 +288,55 @@ TEMPLATE_DSH: dict = {
         "medium": {"param": "--patch", "value": "medium"},
         "high": {"param": "--patch", "value": "high"},
     },
+    "renderer": "config_binding",
+    "binding": "config",
+    "protocols": ["anthropic"],
+    "isolated_dir_mode": "env-isolated",
     "transcript": {
-        "path": "dsh",
-        "glob": "sessions/*/{session_id}/session.jsonl.zstd",
-        "session_id_is_filename": False,
+        "roots": [
+            {"type": "env", "name": "DSH_HOME"},
+            {"type": "home", "subpath": ".dsh"},
+        ],
+        "glob": [
+            "sessions/*/{session_id}/session.jsonl.zstd",
+            "sessions/*/{session_id}/session.jsonl",
+        ],
+        "source_type": "zstd",
+        "authoritative_source": None,
     },
-    # 头号坑(2026-08-17 实证): dsh 沙箱 workspace-write 默认挡账本写入,
-    # 安装时须配置 allowlist 放行 TIANJI_HOME 路径。
     "sandbox_allowlist": ["%TIANJI_HOME%"],
     "completion": {
         "session_end_event": None,
         "stop_is_completion": True,
     },
-    # 7.5 续推通道: 无头续跑原语(dsh --resume <session> 实证,续会话参数进 app;
-    # headless 一次性任务即普通 prompt,resume 走 --resume 续同会话)
     "resume": {
         "cmd": "dsh --profile headless --resume {session_id}",
         "prompt": "继续任务书: {task_path}",
+    },
+    "permission_slot": {
+        "mechanism": "auto_approve",
+        "hook_action": "cancel",
+        "rules": {"file": "autoapprove.json", "format": "autoapprove_v1"},
+        "headless": {"policy": "suspend", "fallback": "timeout_kill",
+                     "timeout_seconds": {"config": "permission_cline_timeout", "default": 120}},
+    },
+    "controller_settings": {
+        "role_text_target": "ctrl_session",
+        "permissions": {},
+    },
+    "provider_env": {},
+    "adapter": {
+        "template": "generic",
+        "output_file": "tianji_dsh_hook.py",
+    },
+    "hooks": {
+        "manifest_merge": "standalone",
+        "managed_keys": ["tianji"],
+    },
+    "capabilities": {
+        "statusline": {"enabled": False},
+        "quota_sources": ["transcript"],
+        "tier3_process_alive": False,
     },
 }
 
@@ -230,21 +376,70 @@ TEMPLATE_KIMI: dict = {
         "interrupt_on_empty": True,
     },
     "thinking_level_map": None,  # kimi 暂无思考级别映射
+    "renderer": "config_binding",
+    "binding": "config",
+    "protocols": ["anthropic"],
+    "isolated_dir_mode": "workdir-grouping",
     "transcript": {
         # 档 1 = kimi hooks Beta;档 2 = wire.jsonl 权威校验源
-        "path": "kimi",
-        "glob": "wire-{session_id}.jsonl",
-        "session_id_is_filename": False,
-        # 权威校验源标志: 档 1 缺口由档 2 wire.jsonl 兜底纠偏
+        "roots": [
+            {"type": "env", "name": "KIMI_HOME"},
+            {"type": "home", "subpath": ".kimi"},
+        ],
+        "glob": [
+            "wire.jsonl",
+            "wire/wire.jsonl",
+            "wire/wire-{session_id}.jsonl",
+            "wire-{session_id}.jsonl",
+        ],
+        "source_type": "jsonl",
         "authoritative_source": "wire",
     },
     "sandbox_allowlist": [],
     # 权限位: 规则表(kimi 钩子只能 deny,放行靠规则表,6.6)
     "permission_slot": {
-        "type": "rule_table",
-        "hook_action": "deny",  # 钩子侧只能 deny
-        "release_channel": "rule_table",  # 放行靠规则表
+        "mechanism": "rule_table",
+        "hook_action": "deny",
+        "rules": {"file": "permission-rules.json",
+                   "format": "allow_deny_lists_v1"},
+        "headless": {"policy": "deny", "fallback": "static_rules_deny"},
     },
+    # 总控 settings 写入
+    "controller_settings": {
+        "role_text_target": "ctrl_session.role_text",
+        "permissions": {},
+        "ctrl_session": {
+            "protocol": "acp",
+            "launch": ["kimi", "acp"],
+            "data_root_env": "KIMI_CODE_HOME",
+        },
+    },
+    "provider_env": {
+        "target": "process_env",
+        "map": {
+            "KIMI_MODEL_NAME": "{model}",
+            "KIMI_MODEL_API_KEY": "${key}",
+            "KIMI_MODEL_BASE_URL": "{base_url}",
+            "KIMI_MODEL_PROVIDER_TYPE": "{protocol}",
+        },
+    },
+    # 适配器
+    "adapter": {
+        "template": "generic",
+        "output_file": "tianji_kimi_hook.py",
+    },
+    # 钩子清单
+    "hooks": {
+        "manifest_merge": "deep_merge_managed",
+        "managed_keys": ["tianji"],
+    },
+    # 能力声明
+    "capabilities": {
+        "statusline": {"enabled": False},
+        "quota_sources": ["transcript", "ccswitch"],
+        "tier3_process_alive": False,
+    },
+    # 完成判定
     "completion": {
         # 完成判定: SessionEnd / Stop
         "session_end_event": "session_end",
@@ -288,21 +483,53 @@ TEMPLATE_ATOMCODE: dict = {
         "interrupt_on_empty": False,
     },
     "thinking_level_map": None,
+    "renderer": "config_binding",
+    "binding": "config",
+    "protocols": ["anthropic", "openai"],
+    "isolated_dir_mode": "atomcode-home",
     "transcript": {
         # 档 2: sessions/<hex>/<uuid>.jsonl 按轮追加解析
         # <hex> = 实例隔离目录哈希(ATOMCODE_HOME)
         # <uuid> = 会话 UUID
-        "path": "atomcode",
-        "glob": "sessions/{hex}/{uuid}.jsonl",
-        "session_id_is_filename": False,
+        "roots": [
+            {"type": "env", "name": "ATOMCODE_HOME"},
+            {"type": "home", "subpath": ".atomcode"},
+        ],
+        "glob": ["sessions/*/{session_id}.jsonl"],
+        "source_type": "jsonl",
+        "authoritative_source": None,
     },
     "sandbox_allowlist": [],
+    # 6.6 权限位: 钩子 allow 类(atomcode)放行三路之一
+    "permission_slot": {
+        "mechanism": "hook_allow",
+        "hook_response_format": "cc",
+        "hook_action": "deny",
+        "headless": {"policy": "deny", "fallback": "hook_deny"},
+    },
+    "controller_settings": {
+        "role_text_target": "ctrl_session",
+        "permissions": {},
+    },
+    "provider_env": {},
+    "adapter": {
+        "template": "generic",
+        "output_file": "tianji_atomcode_hook.py",
+    },
+    "hooks": {
+        "manifest_merge": "deep_merge_managed",
+        "managed_keys": ["tianji"],
+    },
+    "capabilities": {
+        "statusline": {"enabled": False},
+        "quota_sources": ["transcript"],
+        "tier3_process_alive": False,
+    },
     "completion": {
         # 完成判定: session_end
         "session_end_event": "session_end",
         "stop_is_completion": False,
     },
-    # 7.5 续推通道: 无头续跑原语(atomcode -c 续上一会话 + -p 无头 prompt 实证)
     "resume": {
         "cmd": "atomcode -c -p",
         "prompt": "继续任务书: {task_path}",
@@ -345,20 +572,47 @@ TEMPLATE_CLINE: dict = {
         "interrupt_on_empty": False,
     },
     "thinking_level_map": None,
+    "renderer": "config_binding",
+    "binding": "config",
+    "protocols": ["openai"],
+    "isolated_dir_mode": "data-dir",
     "transcript": {
         # 档 2: sessions.db(SQLite)含 pid/exit_code/status 可判活性
         # cline 无 session 级事件 → 完成判定以档 2 + 进程退出为主
-        "path": "cline",
-        "glob": "sessions.db",
-        "session_id_is_filename": False,
-        "source_type": "sqlite",  # 档 2 数据源类型
+        "roots": [
+            {"type": "env", "name": "CLINE_HOME"},
+            {"type": "home", "subpath": ".cline"},
+        ],
+        "glob": ["data/db/sessions.db", "sessions/sessions.db", "sessions.db"],
+        "source_type": "sqlite",
+        "authoritative_source": None,
     },
     "sandbox_allowlist": [],
     # 权限位: autoApprove 大类开关(cline 钩子只能 cancel)
     "permission_slot": {
-        "type": "auto_approve",
-        "hook_action": "cancel",  # 钩子侧只能 cancel
-        "release_channel": "auto_approve",  # 放行靠大类开关
+        "mechanism": "auto_approve",
+        "hook_action": "cancel",
+        "rules": {"file": "autoapprove.json", "format": "autoapprove_v1"},
+        "headless": {"policy": "suspend", "fallback": "timeout_kill",
+                     "timeout_seconds": {"config": "permission_cline_timeout", "default": 120}},
+    },
+    "controller_settings": {
+        "role_text_target": "ctrl_session",
+        "permissions": {},
+    },
+    "provider_env": {},
+    "adapter": {
+        "template": "generic",
+        "output_file": "tianji_cline_hook.py",
+    },
+    "hooks": {
+        "manifest_merge": "deep_merge_managed",
+        "managed_keys": ["tianji"],
+    },
+    "capabilities": {
+        "statusline": {"enabled": False},
+        "quota_sources": ["transcript"],
+        "tier3_process_alive": False,
     },
     "completion": {
         # 无 session 级事件 → 完成判定以档 2(sessions.db) + 进程退出为主
@@ -373,7 +627,8 @@ TEMPLATE_CLINE: dict = {
 
 def _check_required(data: dict) -> None:
     required = ["name", "hook_map", "session_id_keys",
-                "payload_exclude_keys", "interrupt", "transcript"]
+                "payload_exclude_keys", "interrupt", "transcript",
+                "renderer", "binding", "protocols"]
     for k in required:
         if k not in data:
             raise ValueError(f"模板缺少必填字段: {k}")

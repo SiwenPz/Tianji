@@ -10,9 +10,17 @@ from tianji.shellrender import RENDERERS, rerender_instance
 
 
 def test_renderers_cover_five_shells():
-    """验收①: 五个出厂壳各有 renderer(或明确迁移映射到同形态实现)。"""
-    for name in ("claude", "codex", "kimi", "atomcode", "cline"):
-        assert name in RENDERERS, name
+    """验收①: 五个出厂壳各有 morph→renderer 映射(或明确迁移映射到同形态实现)。"""
+    expected_morphs = {
+        "claude": "claude",
+        "codex": "codex",
+        "kimi": "config_binding",
+        "atomcode": "config_binding",
+        "cline": "config_binding",
+        "dsh": "config_binding",
+    }
+    for shell, morph in expected_morphs.items():
+        assert morph in RENDERERS, f"{shell}→{morph} 无渲染器"
 
 
 def test_generic_launcher_has_no_shell_name_branches():

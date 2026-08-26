@@ -24,89 +24,73 @@ from tianji.adapters import template as tpl_mod
 # 转录文件定位
 # ---------------------------------------------------------------------------
 
-def transcript_path(shell: str, session_id: str, home_dir: "Path | None" = None) -> Path | None:
-    """按壳类型返回转录文件路径(不解析内容)。"""
+def transcript_path(shell: str, session_id: str, home_dir: "Path | None" = None,
+                    isolated_dir: str = "") -> Path | None:
+    """按壳条目 transcript 数据定位转录文件(E.3 算法)。
+
+    算法:
+    ① roots 列表顺序解析,首个可访问者为生效根;
+    ② 生效根下按 glob 列表顺序依次 glob,{session_id} 替换,*/** 通配;
+    ③ 多命中按路径字典序稳定排序取第一;
+    ④ source_type=sqlite 时 glob 可不含 {session_id}(reader 用 SQL 过滤);
+    ⑤ 不带 {session_id} 的候选(如 wire.jsonl)为共享/权威源,由 authoritative_source 声明。
+    """
     if not session_id:
         return None
-    home = home_dir or Path.home()
     tpl = tpl_mod.get_template(shell)
     cfg = tpl.transcript
-    path_kind = cfg.get("path", shell)
-
-    if path_kind == "codex":
-        return _codex_path(session_id, home)
-    if path_kind == "dsh":
-        return _dsh_path(session_id, home)
-    if path_kind == "kimi":
-        return _kimi_path(session_id, home)
-    if path_kind == "atomcode":
-        return _atomcode_path(session_id, home)
-    if path_kind == "cline":
-        return _cline_path(session_id, home)
-    # claude / default
-    return _claude_path(session_id, home)
-
-
-def _claude_path(session_id: str, home: Path) -> Path | None:
-    hits = list(home.glob(f".claude/projects/*/{session_id}.jsonl"))
-    return hits[0] if hits else None
-
-
-def _codex_path(session_id: str, home: Path) -> Path | None:
-    base = home / ".codex" / "sessions"
-    if not base.is_dir():
+    roots = cfg.get("roots") or []
+    globs = cfg.get("glob") or []
+    home = home_dir or Path.home()
+    if not roots:
         return None
-    hits = list(base.glob(f"**/rollout-{session_id}.jsonl"))
-    return hits[0] if hits else None
 
-
-def _dsh_path(session_id: str, home: Path) -> Path | None:
-    dsh_home = Path(os.environ.get("DSH_HOME", str(home / ".dsh")))
-    base = dsh_home / "sessions"
-    if not base.is_dir():
+    # ① 顺序解析根,首个可访问者为生效根
+    effective_root = _resolve_root(roots, home, isolated_dir)
+    if effective_root is None:
         return None
-    for suffix in ("session.jsonl.zstd", "session.jsonl"):
-        hits = list(base.glob(f"*/{session_id}/{suffix}"))
-        if hits:
-            return hits[0]
+
+    # ② 生效根下按 glob 顺序查找
+    hits = []
+    for pattern in globs:
+        resolved = pattern.replace("{session_id}", session_id)
+        hits.extend(effective_root.glob(resolved))
+        # 也试 ** 递归(glob("**/...") 需要 rglob)
+        if "**" in resolved:
+            hits.extend(effective_root.glob(resolved.replace("**/", "")))
+
+    if not hits:
+        return None
+
+    # ③ 多命中字典序稳定排序取第一
+    hits.sort(key=lambda p: str(p))
+    return hits[0]
+
+
+def _resolve_root(roots: list, home: Path, isolated_dir: str = "") -> Path | None:
+    """顺序解析根列表,返回首个可访问的目录。"""
+    for r in roots:
+        rtype = r.get("type", "home")
+        if rtype == "isolated_dir":
+            if isolated_dir and Path(isolated_dir).is_dir():
+                return Path(isolated_dir)
+        elif rtype == "env":
+            name = r.get("name", "")
+            env_val = os.environ.get(name, "")
+            if env_val:
+                p = Path(env_val)
+                if p.is_dir():
+                    return p
+            # 回退 home/.name
+            fallback = home / name.lstrip(".")
+            if fallback.is_dir():
+                return fallback
+        elif rtype == "home":
+            subpath = r.get("subpath", "")
+            p = home / subpath
+            if p.is_dir():
+                return p
     return None
-
-
-def _kimi_path(session_id: str, home: Path) -> Path | None:
-    kimi_home = Path(os.environ.get("KIMI_HOME", str(home / ".kimi")))
-    candidates = (
-        kimi_home / "wire.jsonl",
-        kimi_home / "wire" / "wire.jsonl",
-        kimi_home / "wire" / f"wire-{session_id}.jsonl",
-        kimi_home / f"wire-{session_id}.jsonl",
-    )
-    return next((p for p in candidates if p.is_file()), None)
-
-
-def _atomcode_path(session_id: str, home: Path) -> Path | None:
-    """atomcode 档 2 转录: sessions/<hex>/<uuid>.jsonl 按轮追加解析。
-
-    多实例隔离 = ATOMCODE_HOME。
-    <hex> = 实例隔离目录哈希; <uuid> = 会话 UUID。
-    按轮追加: 同一文件增量写入,解析侧用独立游标推进。
-    """
-    atomcode_home = Path(os.environ.get("ATOMCODE_HOME", str(home / ".atomcode")))
-    base = atomcode_home / "sessions"
-    if not base.is_dir():
-        return None
-    # <hex> 子目录下 <uuid>.jsonl, uuid 即 session_id
-    hits = list(base.glob(f"*/{session_id}.jsonl"))
-    return hits[0] if hits else None
-
-
-def _cline_path(session_id: str, home: Path) -> Path | None:
-    cline_home = Path(os.environ.get("CLINE_HOME", str(home / ".cline")))
-    candidates = (
-        cline_home / "data" / "db" / "sessions.db",
-        cline_home / "sessions" / "sessions.db",
-        cline_home / "sessions.db",
-    )
-    return next((p for p in candidates if p.is_file()), None)
 
 
 # ---------------------------------------------------------------------------

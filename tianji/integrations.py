@@ -334,10 +334,25 @@ def ensure_instance_entries(conn, ident, shell, shell_entry=None,
     if not auth.check_controller(conn, ident):
         raise PermissionError("集成注册表变更仅总控身份可执行")
     bridged = []
+
+    # Convergence fields (renderer, provider_env, ...) 来自路由器模板;
+    # SHELL_ENTRY_DEFAULTS 只含装配数据(binding/protocols), 不含渲染决策。
+    _convergence: dict = {}
+    try:
+        from .adapters.template import _BUILTIN as _templates
+        _convergence = dict(_templates.get(shell, {}))
+    except (ImportError, AttributeError):
+        pass
+
     with tx(conn) as c:
         skey = f"integration_shell:{shell}"
         if _config(c, skey) is None:
             value = dict(shell_entry or {})
+            # 补入收敛字段: template 里有、SHELL_ENTRY_DEFAULTS 没写的字段
+            for k in ("renderer", "provider_env", "controller_settings",
+                      "adapter", "capabilities"):
+                if k in _convergence and k not in value:
+                    value[k] = _convergence[k]
             value["source"] = shell_source
             _write_entry(c, ident, skey, value, request_id)
             bridged.append(skey)

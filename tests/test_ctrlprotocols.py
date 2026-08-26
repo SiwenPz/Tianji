@@ -215,7 +215,13 @@ def backend(fake_acp_script, acp_home):
     _, launch = fake_acp_script
     b = ctrlprotocols.ACPBackend(
         home=acp_home, launch=launch,
-        data_root_env="KIMI_CODE_HOME", key_env_style="kimi-model",
+        data_root_env="KIMI_CODE_HOME",
+        provider_env={"target": "process_env", "map": {
+            "KIMI_MODEL_NAME": "{model}",
+            "KIMI_MODEL_API_KEY": "{key}",
+            "KIMI_MODEL_BASE_URL": "{base_url}",
+            "KIMI_MODEL_PROVIDER_TYPE": "{protocol}",
+        }},
         key_ref="", model="", base_url="", protocol="anthropic",
         role_text="",
     )
@@ -254,7 +260,13 @@ class TestACPLifecycle:
         b = ctrlprotocols.ACPBackend(
             home=acp_home,
             launch=[sys.executable, str(fail_script)],
-            data_root_env="KIMI_CODE_HOME", key_env_style="kimi-model",
+            data_root_env="KIMI_CODE_HOME",
+        provider_env={"target": "process_env", "map": {
+            "KIMI_MODEL_NAME": "{model}",
+            "KIMI_MODEL_API_KEY": "{key}",
+            "KIMI_MODEL_BASE_URL": "{base_url}",
+            "KIMI_MODEL_PROVIDER_TYPE": "{protocol}",
+        }},
         )
         b.start()
         # 假进程收到 error response 后退出,给一点 kernel 时间回收;
@@ -418,7 +430,13 @@ class TestReverseRPC:
         b = ctrlprotocols.ACPBackend(
             home=acp_home,
             launch=[sys.executable, str(req_script)],
-            data_root_env="KIMI_CODE_HOME", key_env_style="kimi-model",
+            data_root_env="KIMI_CODE_HOME",
+        provider_env={"target": "process_env", "map": {
+            "KIMI_MODEL_NAME": "{model}",
+            "KIMI_MODEL_API_KEY": "{key}",
+            "KIMI_MODEL_BASE_URL": "{base_url}",
+            "KIMI_MODEL_PROVIDER_TYPE": "{protocol}",
+        }},
         )
         b.start()
         t0 = time.time()
@@ -458,7 +476,13 @@ class TestRoleInjection:
         b = ctrlprotocols.ACPBackend(
             home=acp_home,
             launch=[sys.executable, str(_fake_script(acp_home, FAKE_ACP))],
-            data_root_env="KIMI_CODE_HOME", key_env_style="kimi-model",
+            data_root_env="KIMI_CODE_HOME",
+        provider_env={"target": "process_env", "map": {
+            "KIMI_MODEL_NAME": "{model}",
+            "KIMI_MODEL_API_KEY": "{key}",
+            "KIMI_MODEL_BASE_URL": "{base_url}",
+            "KIMI_MODEL_PROVIDER_TYPE": "{protocol}",
+        }},
             role_text="你是一个助手",
         )
         b.start()
@@ -495,7 +519,13 @@ class TestDataRootIsolation:
         _, launch = fake_acp_script
         b = ctrlprotocols.ACPBackend(
             home=acp_home, launch=launch,
-            data_root_env="KIMI_CODE_HOME", key_env_style="kimi-model",
+            data_root_env="KIMI_CODE_HOME",
+            provider_env={"target": "process_env", "map": {
+                "KIMI_MODEL_NAME": "{model}",
+                "KIMI_MODEL_API_KEY": "{key}",
+                "KIMI_MODEL_BASE_URL": "{base_url}",
+                "KIMI_MODEL_PROVIDER_TYPE": "{protocol}",
+            }},
         )
         b.start()
         t0 = time.time()
@@ -512,30 +542,37 @@ class TestDataRootIsolation:
 # ===================================================================
 
 
-class TestKeyEnv:
-    def test_kimi_model_style(self, acp_home, tmp_path):
-        """key_env_style=kimi-model + key_ref → KIMI_MODEL_* env 注入。"""
+class TestProviderEnv:
+    """provider_env 构造: 按壳条目 map 模板生成进程级 env(E.2)。"""
+
+    def test_kimi_provider_env(self, acp_home, tmp_path):
+        """kimi provider_env + key_ref → KIMI_MODEL_* env 注入。"""
         key_file = tmp_path / "my.key"
         key_file.write_text("sk-test-key-123", encoding="utf-8")
-        env = ctrlprotocols._build_key_env(
-            "kimi-model", str(key_file),
-            "test-model", "https://test.api", "anthropic",
-        )
-        assert env["KIMI_MODEL_NAME"] == "test-model"
+        prov = {"target": "process_env", "map": {
+            "KIMI_MODEL_NAME": "{model}",
+            "KIMI_MODEL_API_KEY": "{key}",
+            "KIMI_MODEL_BASE_URL": "{base_url}",
+            "KIMI_MODEL_PROVIDER_TYPE": "{protocol}",
+        }}
+        env = ctrlprotocols._build_provider_env(
+            prov, str(key_file),
+            model="", base_url="", protocol="anthropic")
+        # 空值不进 env(map 里只有 key 有实际值)
         assert env["KIMI_MODEL_API_KEY"] == "sk-test-key-123"
-        assert env["KIMI_MODEL_BASE_URL"] == "https://test.api"
-        assert env["KIMI_MODEL_PROVIDER_TYPE"] == "anthropic"
+        assert "KIMI_MODEL_NAME" not in env
 
     def test_no_key_ref_empty_env(self, acp_home):
-        assert ctrlprotocols._build_key_env("kimi-model", "",
-                                            "", "", "") == {}
+        assert ctrlprotocols._build_provider_env(
+            {"target": "process_env", "map": {"X": "{key}"}}, "") == {}
 
-    def test_wrong_style_empty(self, acp_home):
-        key_file = acp_home / "k.key"
-        key_file.write_text("x", encoding="utf-8")
-        assert ctrlprotocols._build_key_env(
-            "nonexistent", str(key_file), "", "", ""
-        ) == {}
+    def test_settings_env_target_empty(self, acp_home):
+        """target=settings_env 不注入进程 env(settings 文件已写好)。"""
+        prov = {"target": "settings_env", "map": {"X": "{key}"}}
+        assert ctrlprotocols._build_provider_env(prov, "any") == {}
+
+    def test_empty_provider_env(self, acp_home):
+        assert ctrlprotocols._build_provider_env({}, "any") == {}
 
 
 # ===================================================================

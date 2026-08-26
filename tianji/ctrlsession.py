@@ -41,7 +41,7 @@ class ControllerSession:
             launch = ["claude"]
         self._backend: ClaudeStreamBackend = ClaudeStreamBackend(
             home=home, launch=launch,
-            data_root_env=None, key_env_style="cli-env",
+            data_root_env=None, provider_env={},
         )
 
     # ------------------------------------------------------------ 生命周期

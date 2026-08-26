@@ -18,9 +18,25 @@ from pathlib import Path
 from . import auth, integrations, ops, shellrender
 from .db import now, tx
 
-# 13.2 分类法: provider 绑定方式决定启动器生成方式
-ENV_BINDING_SHELLS = ("claude", "codex")       # env 注入型
-CONFIG_BINDING_SHELLS = ("kimi", "atomcode", "cline")  # 壳内配置型
+def _load_shell_entry(conn, shell: str) -> dict:
+    """读壳条目(集成注册表优先,shell: 兼容);缺则读内置模板兜底。"""
+    row = conn.execute("SELECT value FROM configs WHERE key=?",
+                       (f"integration_shell:{shell}",)).fetchone()
+    if row is not None:
+        return json.loads(row["value"])
+    row = conn.execute("SELECT value FROM configs WHERE key=?",
+                       (f"shell:{shell}",)).fetchone()
+    if row is not None:
+        return json.loads(row["value"])
+    # 内置模板兜底
+    try:
+        from .adapters.template import _BUILTIN, Template
+        data = _BUILTIN.get(shell)
+        if data:
+            return dict(data)
+    except (ImportError, AttributeError):
+        pass
+    return {}
 
 def install_skills(conn, ident, target_dir, request_id=None) -> dict:
     """技能装入总控会话技能目录(19.3 交付,票 16): 复制内置技能包(10 技能)。"""
@@ -44,20 +60,33 @@ def install_skills(conn, ident, target_dir, request_id=None) -> dict:
 SHELL_ENTRY_DEFAULTS = {
     "claude": {"binding": "env", "protocols": ["anthropic"],
                "isolated_dir_mode": "settings-file",
+               "renderer": "claude",
                "ctrl_session": {"protocol": "stream-json",
                                 "launch": ["claude"]}},
     "codex": {"binding": "env", "protocols": ["openai"],
-              "isolated_dir_mode": "codex-home"},
+              "isolated_dir_mode": "codex-home",
+              "renderer": "codex"},
     "kimi": {"binding": "config", "protocols": ["anthropic"],
              "isolated_dir_mode": "workdir-grouping",
+             "renderer": "config_binding",
              "ctrl_session": {"protocol": "acp",
                               "launch": ["kimi", "acp"],
                               "data_root_env": "KIMI_CODE_HOME",
-                              "key_env_style": "kimi-model"}},
+                              "provider_env": {
+                                  "target": "process_env",
+                                  "map": {
+                                      "KIMI_MODEL_NAME": "{model}",
+                                      "KIMI_MODEL_API_KEY": "{key}",
+                                      "KIMI_MODEL_BASE_URL": "{base_url}",
+                                      "KIMI_MODEL_PROVIDER_TYPE": "anthropic",
+                                  },
+                              }}},
     "atomcode": {"binding": "config", "protocols": ["anthropic", "openai"],
-                 "isolated_dir_mode": "atomcode-home"},
+                 "isolated_dir_mode": "atomcode-home",
+                 "renderer": "config_binding"},
     "cline": {"binding": "config", "protocols": ["openai"],
-              "isolated_dir_mode": "data-dir"},
+              "isolated_dir_mode": "data-dir",
+              "renderer": "config_binding"},
 }
 
 # 机械扫描候选(2026-08-20 用户裁决): init 的壳列表=扫用户机器实际装的,
@@ -182,7 +211,9 @@ def add_instance(conn, ident, name, shell, model, key_name="",
     """
     if not auth.check_controller(conn, ident):
         raise PermissionError("向导新增实例仅总控身份可执行")
-    if shell not in ENV_BINDING_SHELLS + CONFIG_BINDING_SHELLS:
+    # 壳条目读 binding 字段(6.2 data-driven): env/config 为合法值
+    entry = _load_shell_entry(conn, shell)
+    if entry.get("binding") not in ("env", "config"):
         raise ValueError(f"未知壳 {shell}(新壳先走 new-shell-onboarding 八问检查单)")
 
     # 幂等(3.3): 各子操作各自单事务,本函数不包大事务(防 BEGIN 嵌套)
@@ -275,11 +306,10 @@ def add_instance(conn, ident, name, shell, model, key_name="",
 def _write_controller_settings(home_p: Path, home: str, shell: str, secret: str,
                                provider: dict = None, ready: bool = False,
                                cards: list = None) -> str:
-    """settings-controller.json 一体文件: 总控会话配置(依壳分支)。
+    """settings-controller.json 一体文件: 总控会话配置(壳条目 data-driven)。
 
-    claude: 环境变量 + appendSystemPrompt + permissions。
-    kimi:  ctrl_session 协议块(acp/启动器/data_root_env/角色话术)。
-    其他壳: 最小 env + plain_talk 角色自述。
+    通用结构: env + 按壳条目 controller_settings 决定的 ctrl_session / appendSystemPrompt / permissions。
+    provider 凭据映射按 provider_env.map 自动生成(E.2)。
     """
     intro = (
         "你是天机(Tianji)的总控——一个把多个 AI 编程助手编排成协作框架的工具,"
@@ -297,135 +327,112 @@ def _write_controller_settings(home_p: Path, home: str, shell: str, secret: str,
         "不亲自写实现代码;有可派的工人实例时,实施必派单给工人。")
     role_text = intro + plain_talk + controller_discipline
 
-    if shell == "claude":
-        _write_claude_settings(home_p, home, shell, secret,
-                               provider, ready, cards, intro, role_text)
-    elif shell == "kimi":
-        _write_kimi_settings(home_p, home, shell, secret,
-                             provider, role_text)
-    else:
-        _write_generic_settings(home_p, home, shell, secret,
-                                role_text)
-    settings = home_p / "settings-controller.json"
-    return str(settings)
+    # 读壳条目(6.2 data-driven): 集成注册表优先,内置模板兜底;未知壳写最小 env
+    from .adapters.template import get_template
+    try:
+        tpl = get_template(shell)
+        cs = tpl.controller_settings or {}
+        prov = tpl.provider_env or {}
+    except KeyError:
+        cs, prov = {}, {}
 
-def _write_claude_settings(home_p, home, shell, secret, provider, ready,
-                           cards, intro, role_text):
-    """claude: env + appendSystemPrompt + permissions。"""
+    # 通用 env
     env = {"TIANJI_HOME": home, "TIANJI_WORKER_ID": "总控",
            "TIANJI_SECRET": secret, "PYTHONIOENCODING": "utf-8"}
+    # provider 凭据注入(按 provider_env.map 模板)
     if provider:
-        env["ANTHROPIC_AUTH_TOKEN"] = provider["key_value"].strip()
-        env["ANTHROPIC_BASE_URL"] = provider["base_url"]
-        if provider.get("model"):
-            env["ANTHROPIC_MODEL"] = provider["model"]
-            for tier in ("HAIKU", "SONNET", "OPUS", "FABLE"):
-                env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"] = provider["model"]
-    doc = {"env": env, "ctrl_session": {
-        "protocol": "stream-json", "launch": ["claude"]}}
-    if ready or provider:
-        worker_cards = [c for c in (cards or [])
-                        if not c.get("is_controller_card")]
-        if worker_cards:
-            roster = ";".join(
-                "%s + %s(%s)" % (
-                    c["shell"], c["model"],
-                    ("key 名 %s" % c["key_name"])
-                    if c.get("source") == "key" else "免 key")
-                for c in worker_cards)
-            doc["appendSystemPrompt"] = (
-                intro +
-                "你的模型已就绪。用户的牌已在配置页盘点好、key 也已落地,"
-                "但角色分工还没定。跟他敲定分工(这是商量活,根据他的牌给建议,"
-                "他调整或确认): 牌面——" + roster + "。"
-                "分工要求: 总控=你,兼架构师和裁判(拆活/定计划/裁决分歧,不用单配);"
-                "审核是双轴交叉把关,要两个不同实例、最好不同源的模型——只配一个"
-                "=自查自审,质量降级要如实说;实施一个起步,同配置可多开几个。"
-                "摆分工清单时一行一个实例(角色/助手/模型/实例名都写全),"
-                "不合并、不省略,让他一眼看到完整编制。"
-                "敲定后你用 tianji wizard add <实例名> <助手名> <模型> "
-                "--key-name <key名> --confirm 逐个注册(免 key 的不带 --key-name;"
-                "多开就按个数多注册几个不同实例名),全部注册完告诉他编制齐了。"
-                "没敲定分工前不建任务。"
-                "他要加牌面之外的助手(天机没模板的,比如 dsh): 如实告诉他这个助手"
-                "天机暂不支持、接入是另一笔活(要走新壳检查单),别现场翻代码开搞,"
-                "先拿现有的牌把分工定了。"
-                "他明确指定的分工,照办,不要反驳、不要另推方案——有障碍就点明"
-                "需要做什么(比如'这个助手要先走接入流程,要不要现在配'),"
-                "让他确认,选择权在他。"
-                "命令用法一律用 tianji <命令> --help 现查,不要翻仓库源码学用法"
-                "(慢且烧 token)。" +
-                role_text)
-        else:
-            doc["appendSystemPrompt"] = (
-                intro +
-                "provider(模型服务)已经配好,可以正常工作: 用户有活就接,"
-                "按天机流程走。先跟用户打个招呼、一句话报一下当前编制。"
-                "他要加助手/加模型,让他去 web 配置页点选补配"
-                "(驾驶舱顶部'配置'按钮,或 tianji start 会自动打开)。" +
-                role_text)
-    else:
-        doc["appendSystemPrompt"] = (
-            intro +
-            "你的 provider(模型服务)还没配齐。配置在 web 配置页点选完成,"
-            "不要用对话引导他配置——让他打开配置页(驾驶舱顶部'配置'按钮,"
-            "或重跑 tianji start 自动打开)接着配,配齐前不建任务。" +
-            role_text)
-    doc["permissions"] = {
-        "allow": ["Bash(python -m tianji:*)", "Bash(python -m tianji)",
-                  "Bash(tianji:*)"],
-    }
-    settings = home_p / "settings-controller.json"
-    settings.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
+        fmt_ctx = {"key": provider.get("key_value", "").strip(),
+                   "base_url": provider.get("base_url", ""),
+                   "model": provider.get("model", "")}
+        for env_key, tpl_str in prov.get("map", {}).items():
+            try:
+                val = tpl_str.format(**fmt_ctx)
+            except KeyError:
+                val = ""
+            if val:
+                env[env_key] = val
 
-def _write_kimi_settings(home_p, home, shell, secret, provider, role_text):
-    """kimi: ctrl_session 块(acp 协议 + kimi acp 启动 + 角色话术)。"""
-    key_ref = ""
-    model, base_url = "", ""
-    if provider:
-        model = provider.get("model", "")
-        base_url = provider.get("base_url", "")
-        kname = provider.get("key_name", "")
-        if kname:
-            key_ref = str(home_p / "keys" / f"{kname}.key")
-    settings = home_p / "settings-controller.json"
-    ctrl_session = {
-        "protocol": "acp",
-        "launch": ["kimi", "acp"],
-        "key_env_style": "kimi-model",
-        "key_ref": key_ref,
-        "model": model,
-        "base_url": base_url,
-        "data_root_env": "KIMI_CODE_HOME",
-        "role_text": role_text,
-    }
-    env = {
-        "TIANJI_HOME": home,
-        "TIANJI_WORKER_ID": "总控",
-        "TIANJI_SECRET": secret,
-        "PYTHONIOENCODING": "utf-8",
-    }
-    doc = {"env": env, "ctrl_session": ctrl_session}
-    settings.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-
-def _write_generic_settings(home_p, home, shell, secret, role_text):
-    """其他壳: 最小 env + 角色话术;有 ctrl_session 条目则附带,无则不加。"""
-    entry = SHELL_ENTRY_DEFAULTS.get(shell, {})
-    ctrl_cs = entry.get("ctrl_session")
-    env = {"TIANJI_HOME": home, "TIANJI_WORKER_ID": "总控",
-           "TIANJI_SECRET": secret, "PYTHONIOENCODING": "utf-8"}
     doc = {"env": env}
+
+    # ctrl_session 块
+    ctrl_cs = cs.get("ctrl_session")
     if ctrl_cs:
-        # 角色话术进 ctrl_session 块(from_config 从块里读 role_text);
-        # appendSystemPrompt 只有 claude stream-json 后端会消费,别写错地方。
-        doc["ctrl_session"] = {**ctrl_cs, "role_text": role_text}
-    else:
+        doc["ctrl_session"] = dict(ctrl_cs)
+        # role_text_target 决定角色话术放在哪个字段
+        rtt = cs.get("role_text_target", "")
+        if rtt.startswith("ctrl_session."):
+            key = rtt[len("ctrl_session."):]
+            doc["ctrl_session"][key] = role_text
+        # provider_env 写进 ctrl_session(target=process_env 的壳在运行时用)
+        if prov.get("target") == "process_env":
+            doc["ctrl_session"]["provider_env"] = prov
+        # role_text_target = appendSystemPrompt 的壳(claude)在下面统一处理
+
+    # role_text 在 appendSystemPrompt (claude stream-json)
+    if cs.get("role_text_target") == "appendSystemPrompt":
+        sp_text = role_text
+        if ready or provider:
+            worker_cards = [c for c in (cards or [])
+                            if not c.get("is_controller_card")]
+            if worker_cards:
+                roster = ";".join(
+                    "%s + %s(%s)" % (
+                        c["shell"], c["model"],
+                        ("key 名 %s" % c["key_name"])
+                        if c.get("source") == "key" else "免 key")
+                    for c in worker_cards)
+                sp_text = (
+                    intro +
+                    "你的模型已就绪。用户的牌已在配置页盘点好、key 也已落地,"
+                    "但角色分工还没定。跟他敲定分工(这是商量活,根据他的牌给建议,"
+                    "他调整或确认): 牌面——" + roster + "。"
+                    "分工要求: 总控=你,兼架构师和裁判(拆活/定计划/裁决分歧,不用单配);"
+                    "审核是双轴交叉把关,要两个不同实例、最好不同源的模型——只配一个"
+                    "=自查自审,质量降级要如实说;实施一个起步,同配置可多开几个。"
+                    "摆分工清单时一行一个实例(角色/助手/模型/实例名都写全),"
+                    "不合并、不省略,让他一眼看到完整编制。"
+                    "敲定后你用 tianji wizard add <实例名> <助手名> <模型> "
+                    "--key-name <key名> --confirm 逐个注册(免 key 的不带 --key-name;"
+                    "多开就按个数多注册几个不同实例名),全部注册完告诉他编制齐了。"
+                    "没敲定分工前不建任务。"
+                    "他要加牌面之外的助手(天机没模板的,比如 dsh): 如实告诉他这个助手"
+                    "天机暂不支持、接入是另一笔活(要走新壳检查单),别现场翻代码开搞,"
+                    "先拿现有的牌把分工定了。"
+                    "他明确指定的分工,照办,不要反驳、不要另推方案——有障碍就点明"
+                    "需要做什么(比如'这个助手要先走接入流程,要不要现在配'),"
+                    "让他确认,选择权在他。"
+                    "命令用法一律用 tianji <命令> --help 现查,不要翻仓库源码学用法"
+                    "(慢且烧 token)。" +
+                    role_text)
+            else:
+                sp_text = (
+                    intro +
+                    "provider(模型服务)已经配好,可以正常工作: 用户有活就接,"
+                    "按天机流程走。先跟用户打个招呼、一句话报一下当前编制。"
+                    "他要加助手/加模型,让他去 web 配置页点选补配"
+                    "(驾驶舱顶部'配置'按钮,或 tianji start 会自动打开)。" +
+                    role_text)
+        else:
+            sp_text = (
+                intro +
+                "provider(模型服务)还没配齐。配置在 web 配置页点选完成,"
+                "不要用对话引导他配置——让他打开配置页(驾驶舱顶部'配置'按钮,"
+                "或重跑 tianji start 自动打开)接着配,配齐前不建任务。" +
+                role_text)
+        doc["appendSystemPrompt"] = sp_text
+    elif not ctrl_cs:
+        # 没有 ctrl_session 也没有 appendSystemPrompt 目标 → 兜底放 appendSystemPrompt
         doc["appendSystemPrompt"] = role_text
+
+    # permissions (claude 权限位)
+    perms = cs.get("permissions")
+    if perms:
+        doc["permissions"] = perms
+
     settings = home_p / "settings-controller.json"
     settings.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
                         encoding="utf-8")
+    return str(settings)
 
 def land_cards(conn, home_p: Path, ident: dict, cards: list) -> dict:
     """模型牌落地(web 配置页/机械引导的产物): key 文件/条目 upsert
@@ -565,7 +572,9 @@ def init_bootstrap(home: str = "", shell: str = "claude", model: str = "",
         kfile = kdir / f"{key_name}.key"
         kfile.write_text(key_value.strip(), encoding="utf-8")
         key_ref = str(kfile)
-        protocol = "anthropic" if shell == "claude" else "openai"
+        # 协议从壳条目取首个(6.2 data-driven, init 的 shell 必在 SHELL_ENTRY_DEFAULTS)
+        shell_defaults = SHELL_ENTRY_DEFAULTS.get(shell, {})
+        protocol = (shell_defaults.get("protocols") or ["openai"])[0]
         conn.execute(
             "INSERT OR REPLACE INTO configs (key, value, updated_at)"
             " VALUES (?,?,?)",
@@ -575,12 +584,17 @@ def init_bootstrap(home: str = "", shell: str = "claude", model: str = "",
                 "protocol": protocol, "key_ref": key_ref,
                 "coding_plan": False}, ensure_ascii=False), now()))
         out["steps"].append(f"key 条目 {key_name} 已建/更新")
-        if shell == "claude" and conn.execute(
-                "SELECT 1 FROM configs WHERE key='shell:claude'").fetchone() is None:
+        # 壳条目补建(6.1): 缺就按出厂模板登记
+        skey = f"shell:{shell}"
+        if conn.execute(
+                f"SELECT 1 FROM configs WHERE key=?", (skey,)).fetchone() is None:
+            entry = dict(SHELL_ENTRY_DEFAULTS.get(shell, {"binding": "env",
+                                                           "protocols": ["openai"],
+                                                           "isolated_dir_mode": "workdir-grouping"}))
+            entry["renderer"] = shell_defaults.get("renderer", "config_binding")
             conn.execute(
                 "INSERT INTO configs (key, value, updated_at) VALUES (?,?,?)",
-                ("shell:claude", json.dumps(SHELL_ENTRY_DEFAULTS["claude"],
-                                            ensure_ascii=False), now()))
+                (skey, json.dumps(entry, ensure_ascii=False), now()))
         # 总控实例补上模型/key 引用(票 28 就地改,不重建)
         ident = {"worker_id": "总控", "secret": secret}
         upd = {}

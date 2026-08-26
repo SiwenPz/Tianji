@@ -53,14 +53,14 @@ class BaseBackend:
     """
 
     def __init__(self, home: Path, launch: list[str],
-                 data_root_env: str | None, key_env_style: str,
+                 data_root_env: str | None, provider_env: dict,
                  key_ref: str = "", model: str = "",
                  base_url: str = "", protocol: str = "anthropic",
                  role_text: str = "", cwd: str | None = None):
         self.home = home
         self.launch = launch
         self.data_root_env = data_root_env
-        self.key_env_style = key_env_style
+        self.provider_env = provider_env or {}
         self._key_ref = key_ref
         self._model = model
         self._base_url = base_url
@@ -84,7 +84,7 @@ class BaseBackend:
             doc = json.loads(settings_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return cls(home=home, launch=["claude"], data_root_env=None,
-                       key_env_style="cli-env")
+                       provider_env={})
         cs = doc.get("ctrl_session")
         if cs:
             protocol = cs.get("protocol") or "stream-json"
@@ -92,20 +92,20 @@ class BaseBackend:
             # 有 env 无极 Session 块 → 旧版仅支持 claude
             return ClaudeStreamBackend(
                 home=home, launch=["claude"], data_root_env=None,
-                key_env_style="cli-env")
+                provider_env={})
         else:
             return cls(home=home, launch=["claude"], data_root_env=None,
-                       key_env_style="cli-env")
+                       provider_env={})
         try:
             backend_cls = get_backend_class(protocol)
         except KeyError:
             return cls(home=home, launch=["claude"], data_root_env=None,
-                       key_env_style="cli-env")
+                       provider_env={})
         launch = cs.get("launch") or (["kimi", "acp"] if protocol == "acp" else ["claude"])
         return backend_cls(
             home=home, launch=launch,
             data_root_env=cs.get("data_root_env"),
-            key_env_style=cs.get("key_env_style", "cli-env"),
+            provider_env=cs.get("provider_env", {}),
             key_ref=cs.get("key_ref", ""),
             model=cs.get("model", ""),
             base_url=cs.get("base_url", ""),
@@ -332,10 +332,12 @@ class ACPBackend(BaseBackend):
             isolated = self.home / ".isolated"
             isolated.mkdir(parents=True, exist_ok=True)
             env[self.data_root_env] = str(isolated)
-        env.update(_build_key_env(
-            self.key_env_style,
-            self._key_ref, self._model,
-            self._base_url, self._protocol,
+        env.update(_build_provider_env(
+            self.provider_env,
+            self._key_ref,
+            model=self._model,
+            base_url=self._base_url,
+            protocol=self._protocol,
         ))
         env.update({
             "TIANJI_HOME": str(self.home),
@@ -587,33 +589,36 @@ class ACPBackend(BaseBackend):
 # 辅助: key env 构造
 # ===================================================================
 
-def _cli_env(key_value: str, *_, **__) -> dict:
-    """Claude: --settings 一体文件管 env,return 空(不塞 ANTHROPIC_AUTH_TOKEN)。"""
-    return {}
+def _build_provider_env(provider_env: dict, key_ref: str,
+                        model: str = "", base_url: str = "",
+                        protocol: str = "anthropic") -> dict:
+    """按 provider_env.map 模板(format)构建进程级 env dict(E.2)。
 
-
-def _kimi_model(key_value: str, model: str, base_url: str,
-                protocol: str) -> dict:
-    return {
-        "KIMI_MODEL_NAME": model,
-        "KIMI_MODEL_API_KEY": key_value,
-        "KIMI_MODEL_BASE_URL": base_url,
-        "KIMI_MODEL_PROVIDER_TYPE": protocol,
-    }
-
-
-_KEY_ENV_MAPPERS: dict[str, Callable] = {
-    "cli-env": _cli_env,       # claude: settings 管一切,return 空
-    "kimi-model": _kimi_model, # kimi: KIMI_MODEL_* 家族
-}
-
-
-def _build_key_env(style: str, key_ref: str, model: str,
-                   base_url: str, protocol: str) -> dict:
-    if not key_ref or style not in _KEY_ENV_MAPPERS:
+    provider_env 来源: 壳模板 provider_env 字段→settings-controller.json。
+    target="process_env" 的壳(kimi)在 start() 时调用本函数注入;
+    target="settings_env" 的壳(claude)已在 env 块写好,本函数 return 空。
+    """
+    tgt = provider_env.get("target", "")
+    if tgt != "process_env":
         return {}
-    key_value = Path(key_ref).read_text(encoding="utf-8").strip()
-    return _KEY_ENV_MAPPERS[style](key_value, model, base_url, protocol)
+    pmap = provider_env.get("map")
+    if not pmap:
+        return {}
+    try:
+        key_value = Path(key_ref).read_text(encoding="utf-8").strip() if key_ref else ""
+    except OSError:
+        key_value = ""
+    ctx = {"key": key_value, "model": model, "base_url": base_url,
+           "protocol": protocol}
+    env = {}
+    for var_name, tpl in pmap.items():
+        try:
+            val = tpl.format(**ctx)
+        except (KeyError, ValueError):
+            val = ""
+        if val:
+            env[var_name] = val
+    return env
 
 
 # ===================================================================
