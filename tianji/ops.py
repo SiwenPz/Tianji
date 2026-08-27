@@ -290,6 +290,15 @@ DEFAULTS = {
     "cleanup_tail_lines": "20",
     "idle_bonus_threshold": "3600",   # 空闲超阈值秒数(14.3 软排序加分门槛)
     "idle_bonus": "5",                # 空闲超阈值加分(方案 A: 防饿死防单点)
+    # 票 56: 号池 proxy 常驻默认参数
+    "pool_proxy.max_retries": "5",            # 单请求最大重试次数
+    "pool_proxy.timeout_first_byte": "90",   # 首字节超时(秒)
+    "pool_proxy.timeout_stream_idle": "180", # 流空闲超时(秒)
+    "pool_proxy.timeout_total": "600",       # 非流式总超时(秒)
+    "pool_proxy.circuit_error_threshold": "0.7",  # 熔断错误率阈值
+    "pool_proxy.circuit_min_samples": "15",       # 熔断最少样本数
+    "pool_proxy.circuit_open_seconds": "90",      # 熔断开窗秒数
+    "pool_proxy.circuit_half_open_need": "3",     # 半开探测需连续成功数
     # 组合红黑榜(9.5,票 25): 出厂注册的视图类插件(票 23 接口,可关)
     "plugin:红黑榜": json.dumps({
         "name": "红黑榜", "type": "view", "version": "v1",

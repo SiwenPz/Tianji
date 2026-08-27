@@ -996,3 +996,19 @@ def web(port: int = typer.Option(daemon.WEB_PORT_DEFAULT, "--port",
     """驾驶舱 Web 常驻(最小只读快照,18.2 常驻之二;页面扩展归票 03)。"""
     from .web import run_web
     run_web(port)
+
+
+proxy_app = typer.Typer(help="号池 proxy(票 56): daemon 第三个常驻子进程")
+app.add_typer(proxy_app, name="proxy")
+
+
+@proxy_app.command("run")
+def proxy_run(port: int = typer.Option(daemon.WEB_PORT_DEFAULT + 2,
+                                       "--port",
+                                       help="Proxy 监听端口(默认 8799)"),
+              host: str = typer.Option("127.0.0.1",
+                                       "--host",
+                                       help="监听地址(仅回环)")):
+    """号池 proxy 常驻(被 daemon supervisor 拉起,勿手动长期运行)。"""
+    from .proxy import run_proxy
+    run_proxy(port=port, host=host)
