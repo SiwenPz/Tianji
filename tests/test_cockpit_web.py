@@ -31,11 +31,12 @@ def _task_to(conn, controller, status, title="任务", seq="w"):
     return tid
 
 
-def test_layout_four_sections(client):
-    """验收 1: 布局四段+抽屉齐全(顶部 bar/4 桶/流程卡片区/总控窗格/抽屉)。"""
+def test_layout_three_columns_im(client):
+    """票 34: 深色 IM 三栏(左栏实例列表/中栏总控对话/右栏 peek)+输入框钉底。"""
     html = client.get("/").text
-    for marker in ('id="topbar"', 'id="buckets"', 'id="flow"', 'id="pane"',
-                   'id="drawer"', 'id="stream"', 'id="msg"'):
+    for marker in ('class="rail"', 'class="chat"', 'class="peek closed"',
+                   'id="rail"', 'id="stream"', 'id="flowcards"', 'id="msg"',
+                   'id="peek"'):
         assert marker in html, marker
     for bucket in ("attention", "working", "done", "idle"):
         assert bucket in html

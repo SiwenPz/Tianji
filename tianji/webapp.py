@@ -763,127 +763,264 @@ def setup_page():
     return _SETUP_PAGE
 
 
-_PAGE = """<!DOCTYPE html>
+_PAGE = r"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>天机驾驶舱</title>
 <style>
-/* 整页一屏: body 撑满视口不滚;每个桶独立内滚(超出才出条);总控对话面吃剩余 */
-html,body{height:100%}
-body{font-family:system-ui,sans-serif;margin:0;color:#dde3ee;font-size:13px;display:flex;flex-direction:column;overflow:hidden;
- background:radial-gradient(1200px 500px at 70% -10%,#16203a 0%,#0b0f1a 55%)}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;font-family:system-ui,sans-serif;font-size:13px}
+body{background:#0b0f1a;color:#dde3ee;overflow:hidden}
+button{cursor:pointer;border:0;font-family:inherit;background:#26355c;color:#dde3ee;border-radius:6px;padding:5px 12px}
+button:disabled{opacity:.45;cursor:not-allowed}
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-thumb{background:#263352;border-radius:4px}
 ::-webkit-scrollbar-track{background:transparent}
-#topbar{display:flex;gap:16px;align-items:center;padding:10px 16px;border-bottom:1px solid #1e2740;position:relative;z-index:10;flex:none;
- background:rgba(22,29,46,.75)}
-#topbar b{font-size:16px;letter-spacing:2px;background:linear-gradient(90deg,#8fd0ff,#7ab648);
- -webkit-background-clip:text;background-clip:text;color:transparent}
-#cfgbar{flex:none}
-#buckets{display:flex;gap:10px;padding:10px;flex:none}
-.bucket{flex:1;background:rgba(22,29,46,.8);border:1px solid #1e2740;border-radius:10px;padding:8px 10px;
- min-height:96px;max-height:26vh;overflow-y:auto}
-.bucket h3{margin:0 0 6px;font-size:12px;color:#7e93bd;letter-spacing:1px;position:sticky;top:-8px;
- background:rgba(22,29,46,.97);padding:4px 0}
-.card{background:#1a2338;border-radius:8px;padding:7px 10px;margin-bottom:6px;cursor:pointer;
- border-left:3px solid #31426e;transition:background .15s}
-.card:hover{background:#223052}
-.card.stale{opacity:.5}.card .esc{color:#ff6b6b;font-weight:bold}
-.card .unread{font-weight:bold}
-#flow{padding:0 10px;flex:none;max-height:16vh;overflow-y:auto}
-.approval{background:#22301c;border:1px solid #3d5a2e;border-radius:8px;padding:8px 10px;margin-bottom:6px;display:flex;gap:8px;align-items:center}
-.approval button{cursor:pointer}
-.note{padding:6px 10px;border-radius:8px;margin-bottom:6px}
-.note.red{background:#33181f;border:1px solid #6e2b36}
-.note.green{background:#17301c;border:1px solid #2b6e36}
-#pane{display:flex;flex-direction:column;padding:10px;flex:1;min-height:0}
-#stream{flex:1;min-height:0;overflow-y:auto;background:rgba(13,18,32,.85);border:1px solid #1e2740;
- border-radius:10px;padding:12px 14px}
-#stream div{padding:4px 0;border-bottom:1px solid rgba(30,39,64,.6)}
-#stream .msg-a{white-space:pre-wrap;line-height:1.6}
-#stream .msg-u{color:#8fd0ff;background:#16233d;border-radius:8px;padding:6px 10px;margin:4px 0}
-#inputrow{display:flex;gap:8px;margin-top:10px;flex:none}
-#msg{flex:1;background:#0f1420;color:#dde3ee;border:1px solid #26324e;border-radius:8px;padding:10px}
-#msg:focus{outline:none;border-color:#3d5a8e;box-shadow:0 0 0 2px rgba(61,90,142,.25)}
-#drawer{position:fixed;right:-380px;top:0;width:360px;height:100%;background:#141b2c;border-left:1px solid #1e2740;transition:right .2s;padding:12px;overflow-y:auto;z-index:9}
-#drawer.open{right:0}
-#drawer table{border-collapse:collapse;width:100%}
-#drawer td,#drawer th{border:1px solid #26324e;padding:4px 6px;font-size:12px}
-button{background:#26355c;color:#dde3ee;border:0;border-radius:6px;padding:5px 12px;cursor:pointer}
-button:hover{background:#31447a}
-button.primary{background:linear-gradient(90deg,#3d5a2e,#4a7038)}
+/* ===== 共享零件(原型 A) ===== */
+.avatar{width:34px;height:34px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:600;flex:none}
+.av-claude{background:#c8845a}.av-kimi{background:#5a8fc8}.av-codex{background:#6ab187}.av-cline{background:#9a6ac8}.av-atomcode{background:#c85a7a}
+.av-other{background:#5a6480}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+.dot.working{background:#f5a623}.dot.error{background:#e5534b}.dot.idle{background:#9aa4b8}.dot.done{background:#4caf7d}
+.time{color:#98a2b8;font-size:11px;flex:none}
+.badge{background:#e5534b;color:#fff;border-radius:9px;font-size:11px;padding:1px 7px;flex:none}
+/* ===== 三栏骨架(原型 A): 左栏 280px / 中栏弹性 / 右栏 peek clamp ===== */
+#root{display:flex;height:100%}
+.rail{width:280px;background:#0e1424;border-right:1px solid #1e2740;display:flex;flex-direction:column;flex:none}
+.rail-list{flex:1;min-height:0;overflow-y:auto;padding-bottom:8px}
+.chat{flex:1;display:flex;flex-direction:column;min-width:0;background:radial-gradient(900px 400px at 60% -10%,#14203a 0%,#0b0f1a 60%)}
+.peek{width:clamp(420px,32vw,560px);background:#0e1424;border-left:1px solid #1e2740;flex:none;overflow-y:auto;transition:margin .2s}
+.peek.closed{margin-right:calc(-1 * clamp(420px,32vw,560px))}
+/* 左栏实例行: 卡片化,行间有缝有底,hover 变亮,选中亮边 */
+.rail-item{display:flex;gap:10px;padding:10px 12px;cursor:pointer;border-radius:10px;margin:0 8px 6px;background:#131b30;border:1px solid #1c2642;transition:background .15s,border-color .15s}
+.rail-item:hover{background:#1a2440;border-color:#26324e}
+.rail-item.sel{background:#1c2947;border-color:#3d5a8e;box-shadow:inset 2px 0 0 #5a8fc8}
+.rail h4{margin:16px 14px 6px;color:#7e93bd;font-size:11px;letter-spacing:1.5px;font-weight:600}
+/* 中栏对话面 */
+.chat-head{padding:10px 16px;border-bottom:1px solid #1e2740;display:flex;gap:10px;align-items:center;background:rgba(16,22,42,.8)}
+.stream{flex:1;min-height:0;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
+.bubble-a{background:#1a2338;border:1px solid #22304e;border-radius:4px 14px 14px 14px;padding:9px 13px;max-width:72%;line-height:1.6;white-space:pre-wrap}
+.bubble-u{background:#2b4a7e;border-radius:14px 4px 14px 14px;padding:9px 13px;max-width:72%;margin-left:auto;line-height:1.6;white-space:pre-wrap}
+.sysline{color:#7e93bd;font-size:12px}
+.thinking{color:#f5a623;font-size:12px}
+.approve-card{background:#22301c;border:1px solid #3d5a2e;border-radius:12px;padding:10px 14px;margin-bottom:8px}
+.esc-card{background:#33181f;border:1px solid #6e2b36;border-radius:12px;padding:10px 14px;margin-bottom:8px}
+.esc-card .ack{text-decoration:underline;cursor:pointer}
+.unread{font-weight:bold}
+.inputbar{display:flex;gap:8px;padding:12px 16px;flex:none}
+.inputbar input{flex:1;background:#10162a;border:1px solid #26324e;border-radius:18px;padding:10px 16px;color:#dde3ee;outline:none}
+.inputbar input:focus{border-color:#3d5a8e;box-shadow:0 0 0 2px rgba(61,90,142,.25)}
+/* 按钮分档: 批准=实心绿渐变,驳回=实心红渐变,发送=蓝渐变,次级=ghost */
+.btn-ok{background:linear-gradient(90deg,#2e7d32,#43a047);color:#fff;border-radius:8px;padding:6px 16px;font-weight:600}
+.btn-ok:hover{filter:brightness(1.12)}
+.btn-no{background:linear-gradient(90deg,#c62828,#e5534b);color:#fff;border-radius:8px;padding:6px 16px;font-weight:600}
+.btn-no:hover{filter:brightness(1.12)}
+.btn-ghost{background:#131b30;border:1px solid #26324e;color:#c8d2e8;border-radius:8px;padding:6px 14px;display:inline-flex;gap:6px;align-items:center}
+.btn-ghost:hover{border-color:#3d5a8e;background:#1a2440;color:#fff}
+.btn-ghost .ic{font-size:14px;line-height:1}
+.btn-send{background:linear-gradient(90deg,#2b4a7e,#3d6ab8);color:#fff;border-radius:18px;padding:6px 18px;font-weight:600}
+.btn-send:hover{filter:brightness(1.12)}
+/* 标题呼吸 */
+@keyframes brandGlow{0%,100%{filter:brightness(1)}50%{filter:brightness(1.4)}}
+.brand{font-size:16px;letter-spacing:2px;background:linear-gradient(90deg,#8fd0ff,#7ab648);-webkit-background-clip:text;background-clip:text;color:transparent;animation:brandGlow 3.2s infinite ease-in-out}
+/* 右栏 peek 详情: 渐变头像环+行式分隔,不用重边框表格 */
+.peek-head{padding:18px 16px;border-bottom:1px solid #1e2740;display:flex;gap:12px;align-items:center;background:linear-gradient(180deg,#14203a 0%,#0e1424 100%)}
+.peek-ring{border-radius:50%;padding:2px;background:linear-gradient(135deg,#5a8fc8,#4caf7d)}
+.peek-rows{padding:6px 16px}
+.peek-row{display:flex;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px solid rgba(30,39,64,.6)}
+.peek-row span:first-child{color:#7e93bd;flex:none}
+.peek-acts{padding:14px 16px;display:flex;gap:8px}
+.peek h4{margin:16px 16px 6px;color:#7e93bd;font-size:11px;letter-spacing:1.5px;font-weight:600}
 </style></head><body>
-<div id="topbar"><b>天机驾驶舱</b><span id="clock"></span><span id="cstat"></span>
-<span id="ro" style="color:#ffb454"></span>
-<span style="flex:1"></span><button onclick="location.href='/setup'">配置</button>
-<button onclick="toggleDrawer()">角色/条目</button></div>
-<div id="cfgbar"></div>
-<div id="buckets"></div>
-<div id="flow"></div>
-<div id="pane"><div id="stream"></div>
-<div id="inputrow"><input id="msg" placeholder="批准 16 / 驳回 16 / 批准权限 3,或直接跟总控说话(回车发送)">
-<button onclick="sendMsg()">发送</button></div></div>
-<div id="drawer"><div style="display:flex;align-items:center"><h3 style="flex:1;margin:0">角色编排与条目</h3>
-<button onclick="toggleDrawer()">收起 ×</button></div><div id="org"></div>
-<div id="registry"><h4>集成注册表</h4><div id="registry-status">读取中…</div>
-<div id="registry-list"></div>
-<button id="registry-migrate" onclick="migrateRegistry()">初始化/迁移</button></div></div>
+<div id="root">
+ <div class="rail">
+  <div style="padding:14px 16px 6px"><b class="brand">天机驾驶舱</b>
+  <div class="sysline" id="cstat" style="margin-top:4px"></div></div>
+  <div class="rail-list" id="rail"></div>
+ </div>
+ <div class="chat">
+  <div class="chat-head"><span id="ctrl-av"></span>
+  <div><b>总控</b> <span id="ctrl-dot"></span><div class="sysline" id="ctrl-sub"></div></div>
+  <span id="ro" style="color:#ffb454"></span><span style="flex:1"></span>
+  <button class="btn-ghost" onclick="location.href='/setup'"><span class="ic">⚙️</span>配置</button>
+  <button class="btn-ghost" onclick="openOrg()"><span class="ic">🗂️</span>角色/条目</button></div>
+  <div id="cfgbar"></div>
+  <div class="stream" id="stream"><div id="flowcards"></div></div>
+  <div class="inputbar"><input id="msg" placeholder="跟总控说话 …(批准 16 / 驳回 16 也可以直接敲)">
+  <button class="btn-send" onclick="sendMsg()">发送</button></div>
+ </div>
+ <div class="peek closed" id="peek"></div>
+</div>
 <script>
-const BUCKETS=[["attention","attention(待处理)"],["working","working(进行中)"],["done","done(已结算)"],["idle","idle(空闲)"]];
-let drawerOpen=false;
-let cockpitReadonly=true;
-function toggleDrawer(){drawerOpen=!drawerOpen;document.getElementById("drawer").className=drawerOpen?"open":""}
+/* ===== 状态 ===== */
+const GROUPS=[["attention","待处理"],["working","进行中"],["idle","空闲"],["done","已结算"]];
+let lastState=null,peekOf=null,peekDetail=null,cockpitReadonly=true;
+let SHELLS={},ORGINST=[],snapCards={},orgRoles={};
+const dismissedEsc=new Set();   // 升级卡"知道了"本地确认(重渲染不再冒出)
 function esc(s){return String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;")}
 async function j(u,opt){const r=await fetch(u,opt);return r.json()}
-function cardHtml(c){
- let lbl=esc(c.instance_name)+(c.display_mode==="后台"?"·后台":"");
- if(c.has_escalation)lbl="⚠ "+lbl;
- const msg=(c.last_message&&c.last_message.payload)?(c.last_message.payload.event_type||c.last_message.type||""):"";
- return `<div class="card ${c.session_state==="idle"?"stale":""}" onclick="detail('${esc(c.instance_name)}')">
- <span>${c.status_point||""} <b>${lbl}</b> ${esc(c.model||"")}</span><br>
- <span>${esc(c.task_title||"(空闲)")} #${c.dispatch_id||"-"}</span><br>
- <small>${esc(c.current_tool||"")} · ${esc(String(msg))} @${c.relative_time||""}</small></div>`}
+function shellOf(name){return SHELLS[name]||"other"}
+function avat(name,shell,sz){
+ return `<span class="avatar av-${esc(shell)}" style="${sz?`width:${sz}px;height:${sz}px`:""}">${esc((name||"?")[0])}</span>`}
+/* 升级在卡片上的呈现: 已结算(done)桶的升级必然已恢复(升级恢复口径=任务进 reviewing 及以后),
+   不再当"待处理"冒红点/徽章 */
+function escOn(c){return c.has_escalation&&c.bucket!=="done"}
+function dotCls(c){return escOn(c)?"error":({working:"working",idle:"idle",done:"done"}[c.bucket]||"error")}
+/* ===== 左栏: 实例列表按桶分组(空组不显示;耗时宽度条已裁决先缺) ===== */
+function railItem(c){
+ const name=c.instance_name;
+ const preview=escOn(c)?(c.escalation_summary||"有升级待处理")
+  :(c.current_tool&&c.current_tool!=="待命中"?`正在执行: ${c.current_tool}`:(c.task_title||"(空闲)"));
+ return `<div class="rail-item ${peekOf===name?"sel":""}" onclick="togglePeek('${esc(name)}')">
+ <span style="position:relative">${avat(name,shellOf(name),34)}<span style="position:absolute;right:-1px;bottom:-1px"><span class="dot ${dotCls(c)}"></span></span></span>
+ <span style="flex:1;min-width:0">
+ <span style="display:flex;justify-content:space-between;gap:6px"><b>${esc(name)}</b><span class="time">${esc(c.relative_time||"")}</span></span>
+ <span style="display:flex;justify-content:space-between;gap:6px">
+ <span style="color:#8fa3c8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(preview)}</span>
+ ${escOn(c)?`<span class="badge">1</span>`:""}</span></span></div>`}
+/* ===== 主渲染(1.5s 轮询 /api/state) ===== */
+/* 分组语义: 有待处理升级的一律进"待处理"(沿用 attention 桶语义),其余按桶 */
+function groupOf(c){return escOn(c)||c.bucket==="attention"?"attention":c.bucket}
 function render(d){
- document.getElementById("clock").textContent=new Date().toLocaleString();
+ lastState=d;cockpitReadonly=d.readonly;
  document.getElementById("cstat").textContent=`会话 ${d.counts.sessions} · 升级 ${d.counts.escalations}`;
  document.getElementById("ro").textContent=d.readonly?"只读(未注入总控身份)":"";
- cockpitReadonly=d.readonly;
  document.getElementById("cfgbar").innerHTML=d.configured?"":
   "<div style='background:#3a1d24;border-bottom:1px solid #6e2b36;padding:8px 14px'>"
   +"⚠ 还没配置: 总控助手没选定或编制是空的。<a style='color:#ffb454' href='/setup'>去配置页点选 →</a></div>";
- let bh="";
- for(const [k,label] of BUCKETS){
-  const cards=(d.snapshot[k]||[]);
-  bh+=`<div class="bucket"><h3>${label} (${cards.length})</h3>`+cards.map(cardHtml).join("")+"</div>"}
- document.getElementById("buckets").innerHTML=bh;
+ SHELLS={};for(const i of d.org.instances)SHELLS[i.name]=i.shell;
+ ORGINST=d.org.instances;snapCards={};
+ for(const k of ["attention","working","idle","done"])
+  for(const c of (d.snapshot[k]||[]))snapCards[c.instance_name]=c;
+ // 总控头: 头像+状态点+壳+模型
+ const ctrl=ORGINST.find(i=>i.name==="总控")||ORGINST.find(i=>i.name===d.org.controller);
+ document.getElementById("ctrl-av").innerHTML=avat("总控",ctrl?ctrl.shell:"other",34);
+ document.getElementById("ctrl-sub").textContent=ctrl?`${ctrl.shell} + ${ctrl.model}`:"未配置";
+ // 左栏四桶(空组不显示)
+ const allCards=Object.values(snapCards);
+ let rh="";
+ for(const [k,label] of GROUPS){
+  const cards=allCards.filter(c=>groupOf(c)===k);
+  if(!cards.length)continue;
+  rh+=`<h4>${label} · ${cards.length}</h4>`+cards.map(railItem).join("")}
+ document.getElementById("rail").innerHTML=rh;
+ // 审批卡(墨绿)+升级红卡,排在对话流顶部;升级卡补 unread 类(审计缺口 3,未读加粗生效)
  let fh="";
  for(const a of d.approvals){
   const tag={plan:"计划确认",final:"最终确认",permission:"权限裁决"}[a.kind];
   const what=a.kind==="permission"?`#${a.ruling_id} ${esc(a.worker)}: ${esc(a.tool)}`:`#${a.task_id} ${esc(a.title)}`;
-  fh+=`<div class="approval"><b>[${tag}]</b> ${what}
-  <button onclick="approve('${a.kind}',${a.kind==="permission"?a.ruling_id:a.task_id},'approve')">✓批准</button>
-  <button onclick="approve('${a.kind}',${a.kind==="permission"?a.ruling_id:a.task_id},'reject')">✗驳回</button></div>`}
+  fh+=`<div class="approve-card"><b>[${tag}]</b> ${what}
+  <div style="margin-top:8px;display:flex;gap:8px">
+  <button class="btn-ok" onclick="approve('${a.kind}',${a.kind==="permission"?a.ruling_id:a.task_id},'approve')">✓ 批准</button>
+  <button class="btn-no" onclick="approve('${a.kind}',${a.kind==="permission"?a.ruling_id:a.task_id},'reject')">✗ 驳回</button></div></div>`}
  for(const e of d.escalations){
-  fh+=`<div class="note ${e.recovered?"green":"red"}">${e.recovered?"✓已恢复":"⚠"} 任务#${e.task_id??"-"}: ${esc(e.reason)}</div>`}
- document.getElementById("flow").innerHTML=fh||"<small style='color:#567'>无待办/升级</small>";
- // 抽屉: 焦点在内则不重建(不吞勾选)
- const dr=document.getElementById("drawer");
- if(!dr.contains(document.activeElement)){
-  const o=d.org;let oh=`<p>总控/架构师/裁判: <b>${esc(o.controller)}</b></p><table><tr><th>实例</th><th>壳</th><th>模型</th><th>key</th><th>模式</th></tr>`;
-  for(const i of o.instances)oh+=`<tr><td>${esc(i.name)}</td><td>${esc(i.shell)}</td><td>${esc(i.model)}</td><td>${esc(i.key_name)}</td><td>${i.display_mode}</td></tr>`;
-  oh+="</table><h4>壳条目</h4><table>"+Object.keys(o.shells).map(k=>`<tr><td>${esc(k)}</td><td><button onclick="delEntry('shell','${esc(k)}')">删</button></td></tr>`).join("")+"</table>";
-  oh+="<h4>Key 条目</h4><table>"+Object.keys(o.keys).map(k=>`<tr><td>${esc(k)}</td><td><button onclick="delEntry('key','${esc(k)}')">删</button></td></tr>`).join("")+"</table>";
-  oh+=`<h4>新增条目</h4><select id="ek"><option>shell</option><option>key</option></select>
-  <input id="en" placeholder="名称"><input id="ed" placeholder='JSON 配置(可空)'>
-  <button onclick="addEntry()">增(标待测试)</button>`;
-  document.getElementById("org").innerHTML=oh}}
+  if(dismissedEsc.has(e.seq))continue;
+  if(e.recovered)
+   fh+=`<div class="approve-card">✓已恢复 任务#${e.task_id??"-"}: ${esc(e.reason)}</div>`;
+  else
+   fh+=`<div class="esc-card unread">⚠ 任务#${e.task_id??"-"}: ${esc(e.reason)} —— <span class="ack" onclick="dismissedEsc.add(${e.seq});this.closest('.esc-card').remove()">知道了</span></div>`}
+ document.getElementById("flowcards").innerHTML=fh;
+ renderPeek()}
+async function approve(kind,id,decision){
+ const r=await j("/api/approve",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({kind,decision,task_id:id,ruling_id:id})});
+ if(r.error)alert(r.error);poll()}
+/* ===== 右栏 peek: 实例详情 / 角色·条目编制表(两者互斥,切换内容不叠开) ===== */
+function togglePeek(name){
+ if(peekOf===name){closePeek();return}
+ peekOf=name;peekDetail=null;
+ if(lastState)render(lastState);
+ refreshDetail(name)}
+function closePeek(){peekOf=null;peekDetail=null;if(lastState)render(lastState)}
+async function refreshDetail(name){
+ try{const d=await j("/api/instance/"+encodeURIComponent(name));
+  if(peekOf===name){peekDetail=d;renderPeek()}}catch(e){}}
+function renderPeek(){
+ const pk=document.getElementById("peek");
+ if(!peekOf){pk.className="peek closed";pk.innerHTML="";pk.dataset.mode="";return}
+ pk.className="peek";
+ if(peekOf==="__org__"){
+  // 编制表不随轮询重建(注册表分区自己刷,重建会把已刷出的内容洗回"读取中"),只在打开时搭骨架
+  if(pk.dataset.mode!=="org"){pk.innerHTML=orgHtml();pk.dataset.mode="org"}
+  return}
+ pk.dataset.mode="inst";
+ pk.innerHTML=instHtml(peekOf)}
+/* 实例详情(审计缺口 1,真详情面板替掉 alert): 快照卡取现状,/api/instance 取派单明细 */
+function instHtml(name){
+ const c=snapCards[name]||{instance_name:name};
+ const shell=shellOf(name);
+ const dp=peekDetail&&peekDetail.dispatches&&peekDetail.dispatches[0];
+ const role=(dp&&dp.worker_role)||"";
+ let dur="-";
+ if(dp){const t1=dp.status==="active"?Math.floor(Date.now()/1000):(dp.updated_at||dp.created_at);
+  dur=Math.max(0,Math.round((t1-dp.created_at)/60))+" min"}
+ const quota=c.quota_pct!=null?`${c.quota_pct}%${c.quota_pct<20?" ⚠将尽":""}`:"-";
+ const rows=[["当前任务",(c.task_title||"(空闲)")+(c.dispatch_id?" #"+c.dispatch_id:"")],
+  ["当前工具",c.current_tool||"-"],["本单耗时",dur],["额度剩余",quota],
+  ["最后动静",c.relative_time||"-"],
+  ["升级状态",escOn(c)?`⚠ ${c.escalation_summary||"有升级"}`:"无"]];
+ const did=c.dispatch_id,tid=c.task_id;
+ return `<div class="peek-head"><span class="peek-ring">${avat(name,shell,44)}</span>
+ <div><div style="font-size:15px"><b>${esc(name)}</b> <span class="dot ${dotCls(c)}"></span></div>
+ <div class="sysline">${esc(shell)} + ${esc(c.model||"")}${role?" · "+esc(role):""}</div></div>
+ <span style="flex:1"></span><button class="btn-ghost" onclick="closePeek()">收起 ×</button></div>
+ <div class="peek-rows">${rows.map(([k,v])=>`<div class="peek-row"><span>${k}</span><span>${esc(v)}</span></div>`).join("")}</div>
+ <div class="peek-acts">
+ <button class="btn-ghost" ${did?"":"disabled"} onclick="nudge(${did||0})">续推 nudge</button>
+ <button class="btn-no" ${(tid||did)?"":"disabled"} onclick="force(${tid||"null"},${did||"null"})">强制干预…</button></div>`}
+/* 续推 nudge: 无专用接口(零新增接口),走 /api/ctrl/send 请总控续推(花钱动作归总控 14.5) */
+async function nudge(did){
+ if(cockpitReadonly){alert("只读: 未注入总控身份");return}
+ const r=await j("/api/ctrl/send",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({text:`请续推(nudge)派单 #${did}: 问一句进展,卡住就升级(7.5 续推通道,来自驾驶舱右栏)`})});
+ if(r.error)alert(r.error)}
+/* 强制干预(审计缺口 2): /api/force,总控身份门控;输入目标状态=task force,留空=取消派单 */
+async function force(tid,did){
+ if(cockpitReadonly){alert("只读: 未注入总控身份");return}
+ let body=null;
+ if(tid){
+  const s=prompt(`强制干预任务 #${tid}: 输入目标状态(如 discussing / archived)\n留空 = 取消当前派单 #${did}`,"");
+  if(s===null)return;
+  if(s.trim())body={task_id:tid,to_state:s.trim()}}
+ if(!body&&did){
+  if(!confirm(`确认取消派单 #${did}?`))return;
+  body={dispatch_id:did}}
+ if(!body)return;
+ const r=await j("/api/force",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+ if(r.error)alert(r.error);poll()}
+/* 角色/条目编制表: 实例行式表(角色=最新派单 worker_role,打开时取一次)+注册表四分区;不做旧的壳/key 增删表单 */
+function openOrg(){
+ peekOf="__org__";
+ if(lastState)render(lastState);
+ for(const i of ORGINST){
+  if(orgRoles[i.name]!=null)continue;
+  j("/api/instance/"+encodeURIComponent(i.name)).then(d=>{
+   orgRoles[i.name]=(d.dispatches&&d.dispatches[0]&&d.dispatches[0].worker_role)||"";
+   const el=document.getElementById("org-rows");
+   if(peekOf==="__org__"&&el)el.innerHTML=orgRowsHtml()}).catch(()=>{orgRoles[i.name]=""})}
+ renderRegistry()}
+function orgRowsHtml(){
+ let h="";
+ for(const i of ORGINST){
+  const role=orgRoles[i.name]||"";
+  h+=`<div class="peek-row"><span>${esc(i.name)}${role?"("+esc(role)+")":""}</span><span>${esc(i.shell)} + ${esc(i.model)}</span></div>`}
+ return h}
+function orgHtml(){
+ return `<div class="peek-head"><b>角色编排与条目</b><span style="flex:1"></span>
+ <button class="btn-ghost" onclick="closePeek()">收起 ×</button></div>
+ <div class="peek-rows" id="org-rows">${orgRowsHtml()}</div>
+ <h4>集成注册表(四分区·含旧条目迁移)</h4>
+ <div class="peek-rows" id="registry"><div class="sysline" id="registry-status" style="padding:4px 0">读取中…</div>
+ <div id="registry-list"></div>
+ <div class="peek-acts" style="padding:12px 0"><button class="btn-ghost" id="registry-migrate" onclick="migrateRegistry()">初始化/迁移</button></div></div>`}
 async function renderRegistry(){
  const box=document.getElementById("registry-list");
  const status=document.getElementById("registry-status");
  const btn=document.getElementById("registry-migrate");
+ if(!box||!status||!btn)return;
  btn.disabled=cockpitReadonly;
  btn.textContent=cockpitReadonly?"只读":"初始化/迁移";
  try{
   const reg=await j("/api/integrations");
-  const entries=reg.entries||[], migrations=reg.migrations||[];
+  const entries=reg.entries||[],migrations=reg.migrations||[];
   const pending=migrations.filter(x=>!x.migrated).length;
   status.textContent=pending
    ?`旧条目迁移: ${migrations.length-pending}/${migrations.length} 已迁移,${pending} 待处理`
@@ -895,11 +1032,10 @@ async function renderRegistry(){
    credential:{title:"Credentials",items:entries.filter(x=>x.key.startsWith("credential:"))}};
   let h="";
   for(const [kind,group] of Object.entries(groups)){
-   h+=`<div data-registry-partition="${kind}"><small>${group.title} (${group.items.length})</small>`;
-   h+=group.items.length?"<table><tr><th>名称</th><th>配置</th><th>迁移</th></tr>":"";
+   h+=`<div data-registry-partition="${kind}"><div class="sysline" style="padding:8px 0 2px">${group.title} (${group.items.length})</div>`;
    for(const item of group.items){
     const name=item.key.split(":",2)[1];
-    let config="", migrated="-";
+    let config="",migrated="";
     if(kind==="protocol"){
      config=`${item.auth_style||""} · ${(item.model_discovery_paths||[]).length} 个发现端点`;
     }else if(kind==="provider"){
@@ -909,9 +1045,8 @@ async function renderRegistry(){
      config=(item.protocols||[]).join(", ");
      migrated=migrations.some(x=>x.target==="integration_shell:"&&x.name===name&&x.migrated)?"已迁移":"登记";
     }else config=item.provider||"";
-    h+=`<tr><td>${esc(name)}</td><td>${esc(config)}</td><td>${esc(migrated)}</td></tr>`}
-   if(group.items.length)h+="</table>";
-   else h+="<div class='muted'>空</div>";
+    h+=`<div class="peek-row"><span>${esc(name)}</span><span>${esc(config)}${migrated?" · "+migrated:""}</span></div>`}
+   if(!group.items.length)h+=`<div class="peek-row"><span>空</span><span>-</span></div>`;
    h+="</div>"}
   box.innerHTML=h;
  }catch(e){status.textContent="注册表读取失败"}}
@@ -923,20 +1058,30 @@ async function migrateRegistry(){
   headers:{"Content-Type":"application/json"},body:"{}"});
  if(r.error)alert(r.error);
  await renderRegistry()}
-async function approve(kind,id,decision){
- const r=await j("/api/approve",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({kind,decision,task_id:id,ruling_id:id})});
- if(r.error)alert(r.error);poll()}
-// ---- 总控真会话对话面: #stream 渲染 claude 事件流,1.5s 轮询拿增量往上拼 ----
-// 活性信号(dsh 式 live tail): 思考 token 状态行原地刷新、思维链 dim 展示、
-// 工具调用单独成行、正文逐 token 打字机(stream_event 增量;assistant 整段兜底)
+/* ===== 总控真会话对话面: #stream 渲染事件流,1.5s 轮询拿增量往上拼 =====
+   活性信号(dsh 式 live tail): "总控正在输入…"行(小头像+橙字)、思维链橙色▸、
+   工具调用单独成行⚙、正文逐 token 打字机(stream_event 增量;assistant 整段兜底) */
 let ctrlNext=0,ctrlAssistantDiv=null,ctrlThinkDiv=null,ctrlStatusDiv=null,ctrlDelta=false;
-function ctrlLine(cls){const d=document.createElement("div");if(cls)d.className=cls;
+function ctrlLine(){const d=document.createElement("div");
  document.getElementById("stream").appendChild(d);return d}
 function ctrlStatus(txt){
- if(!ctrlStatusDiv)ctrlStatusDiv=ctrlLine();
- ctrlStatusDiv.innerHTML=`<small style="color:#567">${esc(txt)}</small>`}
+ if(!ctrlStatusDiv){ctrlStatusDiv=ctrlLine();
+  ctrlStatusDiv.className="sysline";ctrlStatusDiv.style.cssText="display:flex;gap:8px;align-items:center"}
+ ctrlStatusDiv.innerHTML=`${avat("总控",shellOf("总控"),24)}<span class="thinking">${esc(txt)}</span>`}
 function ctrlStatusOff(){if(ctrlStatusDiv){ctrlStatusDiv.remove();ctrlStatusDiv=null}}
+function ctrlAssistant(){
+ if(!ctrlAssistantDiv){
+  const w=ctrlLine();w.style.cssText="display:flex;gap:8px;align-items:flex-start";
+  w.innerHTML=avat("总控",shellOf("总控"),30);
+  ctrlAssistantDiv=document.createElement("div");ctrlAssistantDiv.className="bubble-a";
+  w.appendChild(ctrlAssistantDiv)}
+ return ctrlAssistantDiv}
+function ctrlThink(){
+ if(!ctrlThinkDiv){ctrlThinkDiv=ctrlLine();ctrlThinkDiv.className="thinking";ctrlThinkDiv._t=""}
+ return ctrlThinkDiv}
+function toolLine(name){
+ const d=ctrlLine();d.className="sysline";d.textContent=`⚙ 正在执行: ${name||""}`;
+ ctrlAssistantDiv=null;ctrlThinkDiv=null}
 function renderCtrl(e){
  const st=document.getElementById("stream");
  if(e.type==="system"&&e.subtype==="thinking_tokens"){
@@ -947,82 +1092,67 @@ function renderCtrl(e){
    const d=ev.delta||{};
    if(d.type==="text_delta"&&d.text){
     ctrlStatusOff();ctrlDelta=true;
-    if(!ctrlAssistantDiv)ctrlAssistantDiv=ctrlLine("msg-a");
-    ctrlAssistantDiv.appendChild(document.createTextNode(d.text));}
+    ctrlAssistant().appendChild(document.createTextNode(d.text));}
    else if(d.type==="thinking_delta"&&d.thinking){
     ctrlDelta=true;
-    if(!ctrlThinkDiv){ctrlThinkDiv=ctrlLine();ctrlThinkDiv._t="";}
-    ctrlThinkDiv._t+=d.thinking;
-    ctrlThinkDiv.innerHTML="<small style='color:#567'>思维链: "
-     +esc(ctrlThinkDiv._t)+"</small>";}
+    const t=ctrlThink();t._t+=d.thinking;
+    t.textContent="▸ 思维链: "+t._t;}
   }else if(ev.type==="content_block_start"&&(ev.content_block||{}).type==="tool_use"){
-   ctrlStatusOff();
-   const d=ctrlLine();d.innerHTML=`<small style="color:#8fa3c8">⚙ 正在执行: ${esc(ev.content_block.name||"")}</small>`;
-   ctrlAssistantDiv=null;ctrlThinkDiv=null;}}
+   ctrlStatusOff();toolLine(ev.content_block.name);}}
  else if(e.type==="assistant"){
   const blocks=(e.message&&e.message.content)||[];
   // 增量已渲染过的正文不重复拼;工具调用单独成行
   if(!ctrlDelta){
    const txt=blocks.filter(b=>b.type==="text").map(b=>b.text).join("");
-   if(txt){ctrlStatusOff();
-    if(!ctrlAssistantDiv)ctrlAssistantDiv=ctrlLine("msg-a");
-    ctrlAssistantDiv.appendChild(document.createTextNode(txt));}}
+   if(txt){ctrlStatusOff();ctrlAssistant().appendChild(document.createTextNode(txt));}}
   const thk=blocks.filter(b=>b.type==="thinking").map(b=>b.thinking).join("");
-  if(thk&&!ctrlThinkDiv){const d=ctrlLine();
-   d.innerHTML=`<small style="color:#567">思维链: ${esc(thk)}</small>`;}
-  for(const b of blocks)if(b.type==="tool_use"){
-   const d=ctrlLine();d.innerHTML=`<small style="color:#8fa3c8">⚙ 正在执行: ${esc(b.name||"")}</small>`;
-   ctrlAssistantDiv=null;ctrlThinkDiv=null;}}
+  if(thk&&!ctrlThinkDiv){const t=ctrlThink();t._t=thk;t.textContent="▸ 思维链: "+thk;}
+  for(const b of blocks)if(b.type==="tool_use")toolLine(b.name);}
  else if(e.type==="result"){
-  // 一轮收尾: muted 小结(耗时/cost),清活性状态
+  // 一轮收尾: 小结(耗时/cost),清活性状态
   ctrlAssistantDiv=null;ctrlThinkDiv=null;ctrlDelta=false;ctrlStatusOff();
   const sec=((e.duration_ms||0)/1000).toFixed(1);
   const cost=e.total_cost_usd!=null?(" · $"+e.total_cost_usd):"";
-  const d=ctrlLine();d.innerHTML=`<small style="color:#567">⏱ ${sec}s${cost}</small>`;}
+  const d=ctrlLine();d.className="sysline";d.textContent=`⏱ ${sec}s${cost}`;}
  else if(e.type==="system"&&e.subtype==="restart"){
   ctrlAssistantDiv=null;ctrlThinkDiv=null;ctrlDelta=false;ctrlStatusOff();
-  const d=ctrlLine();d.innerHTML=`<small style="color:#ffb454">⟳ ${esc(e.note||"会话进程重启,上文丢了")}</small>`;}
+  const d=ctrlLine();d.className="thinking";
+  d.textContent=`⟳ ${e.note||"会话进程重启,上文丢了"}`;}
  else if(e.type==="system"&&e.subtype==="error"){
   ctrlAssistantDiv=null;ctrlThinkDiv=null;ctrlDelta=false;ctrlStatusOff();
   const d=ctrlLine();
-  d.innerHTML=`<div style="color:#ff6b6b;padding:8px;border:1px solid #6e2b36;border-radius:6px;background:#3a1d24;margin:4px 0">
-   <b>总控出错:</b> ${esc(e.text||"未知错误")}</div>`;}
+  d.innerHTML=`<div class="esc-card" style="margin-bottom:0"><b>总控出错:</b> ${esc(e.text||"未知错误")}</div>`;}
  // system 其余子类(init 等)过滤不显示
  st.scrollTop=st.scrollHeight}
 async function pollCtrl(){
  try{const r=await j("/api/ctrl/events?after="+ctrlNext);
   ctrlNext=r.next;
   for(const e of r.events)renderCtrl(e)}catch(e){}}
+async function pollCtrlStatus(){
+ try{const r=await j("/api/ctrl/status");
+  document.getElementById("ctrl-dot").innerHTML=`<span class="dot ${r.alive?"working":"idle"}"></span>`}catch(e){}}
 async function sendMsg(){
  const el=document.getElementById("msg");const text=el.value;if(!text)return;
- if(/^(批准|驳回)\\s*(权限)?\\s*#?\\d+\\s*$/.test(text)){
+ if(/^(批准|驳回)\s*(权限)?\s*#?\d+\s*$/.test(text)){
   // 审批口令照旧走 /api/message 机械秒批
   const r=await j("/api/message",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
   if(r.error)alert(r.error);else if(r.note)alert(r.note);}
  else{
-  // 其余文本=跟总控说话: 本地先上墙+立刻亮状态行(不等首轮轮询),回复靠轮询拼
+  // 其余文本=跟总控说话: 本地先上墙(右侧蓝气泡)+立刻亮"正在输入"行(不等首轮轮询),回复靠轮询拼
   ctrlAssistantDiv=null;ctrlThinkDiv=null;ctrlDelta=false;
-  const d=ctrlLine("msg-u");d.innerHTML="<b>我:</b> ";
-  d.appendChild(document.createTextNode(text));
-  ctrlStatus("已发给总控,等它回应 …");
+  const w=ctrlLine();w.style.display="flex";
+  const b=document.createElement("div");b.className="bubble-u";b.textContent=text;w.appendChild(b);
+  const st=document.getElementById("stream");st.scrollTop=st.scrollHeight;
+  ctrlStatus("总控正在输入…");
   const r=await j("/api/ctrl/send",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
-  if(r.error)alert(r.error);}
+  if(r.error){ctrlStatusOff();alert(r.error);}}
  el.value="";poll();pollCtrl()}
-async function addEntry(){
- let data={};const raw=document.getElementById("ed").value;
- try{if(raw)data=JSON.parse(raw)}catch(e){alert("JSON 不合法");return}
- const r=await j("/api/entry",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({kind:document.getElementById("ek").value,name:document.getElementById("en").value,data})});
- if(r.error)alert(r.error);poll()}
-async function delEntry(kind,name){
- const r=await j("/api/entry/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({kind,name})});
- if(r.error)alert(r.error);poll()}
-async function detail(name){
- const r=await j("/api/instance/"+encodeURIComponent(name));
- alert(JSON.stringify(r.profile?{score:r.profile.score,notes:r.profile.notes}:r,null,1))}
 async function poll(){try{render(await j("/api/state"))}catch(e){}}
 document.getElementById("msg").addEventListener("keydown",e=>{if(e.key==="Enter")sendMsg()});
-poll();pollCtrl();renderRegistry();setInterval(()=>{poll();pollCtrl();renderRegistry()},1500);
+poll();pollCtrl();pollCtrlStatus();
+setInterval(()=>{poll();pollCtrl();pollCtrlStatus();
+ if(peekOf==="__org__")renderRegistry();
+ else if(peekOf)refreshDetail(peekOf)},1500);
 </script></body></html>"""
 
 
