@@ -152,6 +152,21 @@ CREATE TABLE IF NOT EXISTS ability_profiles (
   notes TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS force_approvals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  request_id TEXT NOT NULL,
+  initiator_id TEXT NOT NULL,
+  from_state TEXT NOT NULL,
+  to_state TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','approved','rejected','expired','cancelled')),
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER,
+  decided_by TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS configs (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,

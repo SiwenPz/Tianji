@@ -105,9 +105,26 @@ def task_transition(task_id: int, to: str, reason: str = "",
 def task_force(task_id: int, to: str, reason: str,
                new_worker: str = typer.Option(None, "--new-worker"),
                request_id: str = typer.Option(None, "--request-id")):
-    """强制干预(4.4): 总控特权例外转换+审计,不豁免重派计数。改派可用 --new-worker 指定目标工人。"""
-    _out(ops.task_force(_conn(), _ident(), task_id, to, reason, request_id,
-                        new_worker=new_worker))
+    """强制干预(4.4): 既定动作(终止/改派/接管)总控直接执行;兜底跳转创建人审请求(HITL)。"""
+
+
+@task_app.command("approve-force")
+def task_approve_force(approval_id: int):
+    """人审通过兜底跳转请求(HITL): 用户显式批准后迁移才生效。"""
+    _out(ops.force_approve(_conn(), "cli-user", approval_id))
+
+
+@task_app.command("reject-force")
+def task_reject_force(approval_id: int):
+    """人审驳回兜底跳转请求(HITL): 拒绝后迁移不生效。"""
+    _out(ops.force_reject(_conn(), "cli-user", approval_id))
+
+
+@task_app.command("cancel-force")
+def task_cancel_force(approval_id: int):
+    """撤回自己发起的兜底跳转审批请求(批准前可撤)。"""
+    ident = _ident()
+    _out(ops.force_cancel_request(_conn(), ident["worker_id"], approval_id))
 
 
 @task_app.command("verify-cmd")

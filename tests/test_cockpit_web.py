@@ -25,9 +25,10 @@ def _task_to(conn, controller, status, title="任务", seq="w"):
         ops.task_transition(conn, controller, tid, s, request_id=f"rw-{s}-{seq}")
         if status == s:
             return tid
-    if status == "awaiting_final_confirm":
-        ops.task_force(conn, controller, tid, "awaiting_final_confirm",
-                       "测试构造", request_id=f"rw-f-{seq}")
+    if status in ("reviewing", "awaiting_final_confirm", "archived", "reopened"):
+        conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                     (status, ops.now(), tid))
+        return tid
     return tid
 
 
@@ -105,8 +106,8 @@ def test_escalation_red_then_green(client, conn, controller):
                   {"task_id": tid, "reason": "静默超 T1"}, "controller")
     esc = client.get("/api/state").json()["escalations"][0]
     assert esc["recovered"] is False
-    ops.task_force(conn, controller, tid, "reviewing", "恢复",
-                   request_id="rw-e1-rec")
+    ops.task_transition(conn, controller, tid, "reviewing",
+                        request_id="rw-e1-rec")
     esc2 = client.get("/api/state").json()["escalations"][0]
     assert esc2["recovered"] is True
 

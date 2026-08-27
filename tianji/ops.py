@@ -1333,20 +1333,92 @@ def task_reopen(conn, ident, task_id, reason="", request_id=None):
                            request_id=request_id, reason=reason)
 
 
+def _active_dispatch(conn, task_id):
+    """取最新活跃派单(issued/active/stale/escalate)。"""
+    return conn.execute(
+        "SELECT * FROM dispatches WHERE task_id=? "
+        "AND status IN ('issued','active','stale','escalate') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,)).fetchone()
+
+
+def _execute_force(conn, ident, task_id, to_state, reason, request_id,
+                   new_worker, task_row):
+    """直接执行强制干预(三种既定动作: archived/dispatched)。"""
+    t = task_row
+    if to_state == "archived":
+        # 强制终止: 任务 archived + 派单 cancelled + 关登记行
+        conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                     ("archived", now(), task_id))
+        audit(conn, "force_intervention",
+              {"task_id": task_id, "from": t["status"], "to": "archived",
+               "reason": reason, "by": ident["worker_id"]})
+        d = _active_dispatch(conn, task_id)
+        if d:
+            conn.execute(
+                "UPDATE dispatches SET status='cancelled', updated_at=?, dcap_hash=''"
+                " WHERE id=?",
+                (now(), d["id"]))
+            conn.execute(
+                "UPDATE instance_registrations SET status='closed', closed_at=?, abnormal=1"
+                " WHERE dispatch_id=? AND status IN ('spawned','active')",
+                (now(), d["id"]))
+            audit(conn, "force_cancel_dispatch",
+                  {"dispatch_id": d["id"], "task_id": task_id,
+                   "reason": "force_terminate"})
+        messages.send(conn, "escalation", "controller",
+                      {"task_id": task_id,
+                       "reason": f"强制终止: {t['status']}→archived({reason})"},
+                      "controller")
+        return {"task_id": task_id, "from": t["status"], "to": "archived"}
+
+    if to_state == "dispatched":
+        # 改派/接管: 原派单 cancelled + 关登记行 + 任务回 dispatched
+        d = _active_dispatch(conn, task_id)
+        if d is None:
+            raise ValueError("任务无活跃派单,无法改派")
+        conn.execute(
+            "UPDATE dispatches SET status='cancelled', updated_at=?, dcap_hash=''"
+            " WHERE id=?",
+            (now(), d["id"]))
+        conn.execute(
+            "UPDATE instance_registrations SET status='closed', closed_at=?, abnormal=1"
+            " WHERE dispatch_id=? AND status IN ('spawned','active')",
+            (now(), d["id"]))
+        audit(conn, "force_cancel_dispatch",
+              {"dispatch_id": d["id"], "task_id": task_id,
+               "reason": "force_reassign"})
+        # 复用重派: 计数+1 + 新派单(重派计数不豁免)
+        if new_worker:
+            inst = conn.execute(
+                "SELECT name FROM instances WHERE name=? AND is_active=1",
+                (new_worker,)).fetchone()
+            if inst is None:
+                raise ValueError(f"改派目标 {new_worker} 未注册或不活跃")
+        _reschedule(conn, task_id, new_worker or d["worker_id"],
+                    f"force_reassign: {reason}")
+        messages.send(conn, "escalation", "controller",
+                      {"task_id": task_id,
+                       "reason": f"强制改派: {t['status']}→dispatched({reason})"},
+                      "controller")
+        return {"task_id": task_id, "from": t["status"], "to": "dispatched"}
+
+    # 兜底(不应到达: task_force 已拦截)
+    raise ValueError(f"非法直接执行目标: {to_state}")
+
+
 def task_force(conn, ident, task_id, to_state, reason, request_id=None,
                new_worker=None):
-    """强制干预(4.4): 总控 CLI 特权例外转换+审计;不豁免重派计数。
+    """强制干预(4.4): 三种既定动作直接执行+审计;兜底跳转转人审门(HITL)。
 
-    强制终止(to_state=archived): 任务 archived + 在途派单 cancelled + 关工人
-    登记行 + 旧 secret 作废 + 审计行，一笔事务。
-    改派/接管(to_state=dispatched): 原派单 cancelled + 关登记行 + 旧 secret 作废
-    + 审计行 + 任务回 dispatched(重派计数+1, 自动发新派单)。
-    new_worker=改派目标工人;缺省重派给原工人(2026-08-18 补: 原实现改派只能
-    派回原工人,换人无门,4.4 语义不全)。
+    既定动作(强制终止→archived / 接管→dispatched / 改派→dispatched):
+    总控直接执行+审计,不弹审批。
+    兜底跳转(目标态是三种之外): 机械落"待用户审批"请求,等待人批。
+    new_worker=改派目标工人;缺省重派给原工人。
     """
     if not auth.check_controller(conn, ident):
         raise PermissionError("强制干预仅总控身份可执行(4.4)")
-    from .state import FORCE_TARGETS
+    from .state import FORCE_TARGETS, ESTABLISHED_FORCE_TARGETS
     with tx(conn) as c:
         def _do():
             t = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -1357,82 +1429,196 @@ def task_force(conn, ident, task_id, to_state, reason, request_id=None,
             if to_state == t["status"] and to_state != "dispatched":
                 raise ValueError("强制干预目标与当前状态相同")
 
-            # 取最新活跃派单(issued/active/stale/escalate)
-            d = c.execute(
-                "SELECT * FROM dispatches WHERE task_id=? "
-                "AND status IN ('issued','active','stale','escalate') "
-                "ORDER BY id DESC LIMIT 1",
-                (task_id,),
+            if to_state in ESTABLISHED_FORCE_TARGETS:
+                # 既定动作: 直接执行
+                return _execute_force(c, ident, task_id, to_state, reason,
+                                     request_id, new_worker, t)
+            else:
+                # 兜底跳转: 创建人审请求
+                return _create_force_approval(
+                    c, conn, ident, task_id, t["status"], to_state, reason,
+                    request_id)
+        return _with_idem(c, request_id, "task_force", _do)
+
+
+def _create_force_approval(c, conn, ident, task_id, from_state, to_state,
+                           reason, request_id):
+    """创建兜底跳转待审批请求(HITL): 机械落账,等用户显式批准。"""
+    cur = c.execute(
+        "INSERT INTO force_approvals "
+        "(task_id, request_id, initiator_id, from_state, to_state, reason, "
+        "status, created_at) VALUES (?,?,?,?,?,?,'pending',?)",
+        (task_id, request_id or f"fa-{task_id}-{now()}",
+         ident["worker_id"], from_state, to_state, reason, now()))
+    approval_id = cur.lastrowid
+    audit(conn, "force_approval_created",
+          {"approval_id": approval_id, "task_id": task_id,
+           "from": from_state, "to": to_state,
+           "reason": reason, "by": ident["worker_id"]})
+    return {"approval_id": approval_id, "task_id": task_id,
+            "from": from_state, "to": to_state, "reason": reason,
+            "status": "pending",
+            "note": "等待用户审批(HITL): tianji task approve-force "
+                    f"{approval_id}"}
+
+
+FORCE_APPROVAL_TIMEOUT = 86400  # 24 小时超时
+
+
+def expire_force_approvals(conn):
+    """超时未批的兜底跳转请求标记为 expired(不悬置账本)。"""
+    cutoff = now() - FORCE_APPROVAL_TIMEOUT
+    rows = conn.execute(
+        "SELECT id FROM force_approvals WHERE status='pending' AND created_at < ?",
+        (cutoff,)).fetchall()
+    if rows:
+        conn.execute(
+            "UPDATE force_approvals SET status='expired', decided_at=? "
+            "WHERE status='pending' AND created_at < ?",
+            (now(), cutoff))
+        audit(conn, "force_approval_expired",
+              {"count": len(rows),
+               "ids": [r["id"] for r in rows]})
+    return {"expired": len(rows)}
+
+
+def force_approve(conn, approver, approval_id):
+    """用户审批通过兜底跳转请求: 执行迁移并落审计。"""
+    with tx(conn) as c:
+        def _do():
+            r = c.execute(
+                "SELECT * FROM force_approvals WHERE id=?", (approval_id,)
             ).fetchone()
+            if r is None:
+                raise KeyError(f"审批请求 {approval_id} 不存在")
+            if r["status"] != "pending":
+                return {"approval_id": approval_id, "already": r["status"]}
+
+            task_id = r["task_id"]
+            to_state = r["to_state"]
+            from_state = r["from_state"]
+            reason = f"[审批#{approval_id}] {r['reason']}"
+
+            # 取最新活跃派单
+            d = _active_dispatch(c, task_id)
 
             if to_state == "archived":
-                # 强制终止: 任务 archived + 派单 cancelled + 关登记行 + 旧 secret 作废
-                c.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?",
-                          ("archived", now(), task_id))
+                c.execute(
+                    "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                    ("archived", now(), task_id))
                 audit(c, "force_intervention",
-                      {"task_id": task_id, "from": t["status"], "to": "archived",
-                       "reason": reason, "by": ident["worker_id"]})
+                      {"task_id": task_id, "from": from_state, "to": "archived",
+                       "reason": reason, "by": r["initiator_id"],
+                       "approval_id": approval_id})
                 if d:
                     c.execute(
-                        "UPDATE dispatches SET status='cancelled', updated_at=?, dcap_hash=''"
-                        " WHERE id=?",
+                        "UPDATE dispatches SET status='cancelled', updated_at=?, "
+                        "dcap_hash='' WHERE id=?",
                         (now(), d["id"]))
                     c.execute(
-                        "UPDATE instance_registrations SET status='closed', closed_at=?, abnormal=1"
-                        " WHERE dispatch_id=? AND status IN ('spawned','active')",
+                        "UPDATE instance_registrations SET status='closed', "
+                        "closed_at=?, abnormal=1 "
+                        "WHERE dispatch_id=? AND status IN ('spawned','active')",
                         (now(), d["id"]))
                     audit(c, "force_cancel_dispatch",
                           {"dispatch_id": d["id"], "task_id": task_id,
-                           "reason": "force_terminate"})
-                messages.send(c, "escalation", "controller",
-                              {"task_id": task_id,
-                               "reason": f"强制终止: {t['status']}→archived({reason})"},
-                              "controller")
-                return {"task_id": task_id, "from": t["status"], "to": "archived"}
+                           "reason": "force_terminate",
+                           "approval_id": approval_id})
 
-            if to_state == "dispatched":
-                # 改派/接管: 原派单 cancelled + 关登记行 + 旧 secret 作废
-                # + 任务回 dispatched(重派计数+1, 自动新派单)
+            elif to_state == "dispatched":
                 if d is None:
                     raise ValueError("任务无活跃派单,无法改派")
                 c.execute(
-                    "UPDATE dispatches SET status='cancelled', updated_at=?, dcap_hash=''"
-                    " WHERE id=?",
+                    "UPDATE dispatches SET status='cancelled', updated_at=?, "
+                    "dcap_hash='' WHERE id=?",
                     (now(), d["id"]))
                 c.execute(
-                    "UPDATE instance_registrations SET status='closed', closed_at=?, abnormal=1"
-                    " WHERE dispatch_id=? AND status IN ('spawned','active')",
+                    "UPDATE instance_registrations SET status='closed', "
+                    "closed_at=?, abnormal=1 "
+                    "WHERE dispatch_id=? AND status IN ('spawned','active')",
                     (now(), d["id"]))
                 audit(c, "force_cancel_dispatch",
                       {"dispatch_id": d["id"], "task_id": task_id,
-                       "reason": "force_reassign"})
-                # 复用重派: 计数+1 + 新派单(重派计数不豁免)
-                if new_worker:
-                    inst = c.execute(
-                        "SELECT name FROM instances WHERE name=? AND is_active=1",
-                        (new_worker,)).fetchone()
-                    if inst is None:
-                        raise ValueError(f"改派目标 {new_worker} 未注册或不活跃")
-                _reschedule(c, task_id, new_worker or d["worker_id"],
-                            f"force_reassign: {reason}")
-                messages.send(c, "escalation", "controller",
-                              {"task_id": task_id,
-                               "reason": f"强制改派: {t['status']}→dispatched({reason})"},
-                              "controller")
-                return {"task_id": task_id, "from": t["status"], "to": "dispatched"}
+                       "reason": "force_reassign",
+                       "approval_id": approval_id})
+                _reschedule(c, task_id, d["worker_id"],
+                            f"force_approve: {r['reason']}")
 
-            # 其他强制干预(保留原简单逻辑)
-            c.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?",
-                      (to_state, now(), task_id))
-            audit(c, "force_intervention",
-                  {"task_id": task_id, "from": t["status"], "to": to_state,
-                   "reason": reason, "by": ident["worker_id"]})
-            messages.send(c, "escalation", "controller",
-                          {"task_id": task_id,
-                           "reason": f"强制干预: {t['status']}→{to_state}({reason})"},
-                          "controller")
-            return {"task_id": task_id, "from": t["status"], "to": to_state}
-        return _with_idem(c, request_id, "task_force", _do)
+            else:
+                # 兜底目标态: 直接改状态
+                c.execute(
+                    "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                    (to_state, now(), task_id))
+                audit(c, "force_intervention",
+                      {"task_id": task_id, "from": from_state, "to": to_state,
+                       "reason": reason, "by": r["initiator_id"],
+                       "approval_id": approval_id})
+
+            # 更新审批记录
+            c.execute(
+                "UPDATE force_approvals SET status='approved', decided_by=?, "
+                "decided_at=? WHERE id=?",
+                (approver, now(), approval_id))
+            return {"approval_id": approval_id, "task_id": task_id,
+                    "from": from_state, "to": to_state,
+                    "decision": "approved", "by": approver}
+        return _do()
+
+
+def force_reject(conn, approver, approval_id):
+    """用户驳回兜底跳转请求。"""
+    with tx(conn) as c:
+        def _do():
+            r = c.execute(
+                "SELECT * FROM force_approvals WHERE id=?", (approval_id,)
+            ).fetchone()
+            if r is None:
+                raise KeyError(f"审批请求 {approval_id} 不存在")
+            if r["status"] != "pending":
+                return {"approval_id": approval_id, "already": r["status"]}
+            c.execute(
+                "UPDATE force_approvals SET status='rejected', decided_by=?, "
+                "decided_at=? WHERE id=?",
+                (approver, now(), approval_id))
+            audit(conn, "force_approval_rejected",
+                  {"approval_id": approval_id, "task_id": r["task_id"],
+                   "by": approver})
+            return {"approval_id": approval_id, "task_id": r["task_id"],
+                    "decision": "rejected", "by": approver}
+        return _do()
+
+
+def force_cancel_request(conn, requester_id, approval_id):
+    """总控撤回自己的待审批请求(批准前可撤回)。"""
+    with tx(conn) as c:
+        def _do():
+            r = c.execute(
+                "SELECT * FROM force_approvals WHERE id=?", (approval_id,)
+            ).fetchone()
+            if r is None:
+                raise KeyError(f"审批请求 {approval_id} 不存在")
+            if r["initiator_id"] != requester_id:
+                raise PermissionError("只能撤回自己发起的审批请求")
+            if r["status"] != "pending":
+                return {"approval_id": approval_id, "already": r["status"]}
+            c.execute(
+                "UPDATE force_approvals SET status='cancelled', decided_by=?, "
+                "decided_at=? WHERE id=?",
+                (requester_id, now(), approval_id))
+            audit(conn, "force_approval_cancelled",
+                  {"approval_id": approval_id, "task_id": r["task_id"],
+                   "by": requester_id})
+            return {"approval_id": approval_id, "task_id": r["task_id"],
+                    "decision": "cancelled"}
+        return _do()
+
+
+def pending_force(conn) -> list:
+    """待审批的兜底跳转请求列表(供驾驶舱渲染审批卡)。"""
+    rows = conn.execute(
+        "SELECT * FROM force_approvals WHERE status='pending'"
+        " ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
 
 
 def mechanical_verify(conn, task_id, timeout=120):
