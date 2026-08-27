@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 from tianji import auth, wizard
-from tianji.db import connect
+from tianji.db import connect, injected_dir
 
 
 def test_init_bootstrap_full(monkeypatch, tmp_path):
@@ -19,9 +19,9 @@ def test_init_bootstrap_full(monkeypatch, tmp_path):
         base_url="https://api.deepseek.com/anthropic", key_name="官key",
         key_value="sk-init-1", worker="赵云")
     # 产出: key 文件/账本/总控身份/settings 一体文件/工人
-    assert (home / "keys" / "官key.key").read_text() == "sk-init-1"
+    assert (injected_dir() / "官key.key").read_text() == "sk-init-1"
     assert (home / "ledger.db").exists()
-    settings = json.loads((home / "settings-controller.json")
+    settings = json.loads((injected_dir() / "settings-controller.json")
                           .read_text(encoding="utf-8"))
     env = settings["env"]
     assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
@@ -45,13 +45,13 @@ def test_init_idempotent(monkeypatch, tmp_path):
     monkeypatch.setenv("TIANJI_HOME", str(home))
     wizard.init_bootstrap(home=str(home), shell="claude", model="m",
                           base_url="https://a", key_value="sk-1")
-    secret1 = json.loads((home / "settings-controller.json")
+    secret1 = json.loads((injected_dir() / "settings-controller.json")
                          .read_text(encoding="utf-8"))["env"]["TIANJI_SECRET"]
     r2 = wizard.init_bootstrap(home=str(home), shell="claude", model="m",
                                base_url="https://a", key_value="sk-2")
     assert any("总控已注册,跳过" in s for s in r2["steps"])
     # secret 不被二跑轮换
-    secret2 = json.loads((home / "settings-controller.json")
+    secret2 = json.loads((injected_dir() / "settings-controller.json")
                          .read_text(encoding="utf-8"))["env"]["TIANJI_SECRET"]
     assert secret1 == secret2
 
@@ -63,12 +63,12 @@ def test_init_bare_then_configure_later(monkeypatch, tmp_path):
     r1 = wizard.init_bootstrap(home=str(home))
     assert r1["provider_configured"] is False
     assert "配置页" in r1["next"]  # 配置在 web 页点选,不再靠会话聊
-    env1 = json.loads((home / "settings-controller.json")
+    env1 = json.loads((injected_dir() / "settings-controller.json")
                       .read_text(encoding="utf-8"))["env"]
     assert "ANTHROPIC_AUTH_TOKEN" not in env1  # 未配 provider 不写
     assert env1["TIANJI_WORKER_ID"] == "总控"
     # claude 壳: settings 带 appendSystemPrompt=总控角色自述(引导去配置页补配)
-    doc1 = json.loads((home / "settings-controller.json")
+    doc1 = json.loads((injected_dir() / "settings-controller.json")
                       .read_text(encoding="utf-8"))
     assert "总控" in doc1["appendSystemPrompt"]
     assert "provider" in doc1["appendSystemPrompt"]
@@ -82,12 +82,12 @@ def test_init_bare_then_configure_later(monkeypatch, tmp_path):
                                base_url="https://api.deepseek.com/anthropic",
                                key_value="sk-late")
     assert r2["provider_configured"] is True
-    env2 = json.loads((home / "settings-controller.json")
+    env2 = json.loads((injected_dir() / "settings-controller.json")
                       .read_text(encoding="utf-8"))["env"]
     assert env2["ANTHROPIC_AUTH_TOKEN"] == "sk-late"
     assert env2["TIANJI_SECRET"] == env1["TIANJI_SECRET"]  # secret 不轮换
     # 配好后话术换分支: 不再说"还没配齐",防总控重复引导(2026-08-21 模拟)
-    doc2 = json.loads((home / "settings-controller.json")
+    doc2 = json.loads((injected_dir() / "settings-controller.json")
                       .read_text(encoding="utf-8"))
     assert "还没配齐" not in doc2["appendSystemPrompt"]
     assert "已经配好" in doc2["appendSystemPrompt"]
@@ -155,14 +155,14 @@ def test_controller_discipline_in_role_prompt(monkeypatch, tmp_path):
     home = tmp_path / "h"
     monkeypatch.setenv("TIANJI_HOME", str(home))
     wizard.init_bootstrap(home=str(home))
-    doc = json.loads((home / "settings-controller.json")
+    doc = json.loads((injected_dir() / "settings-controller.json")
                      .read_text(encoding="utf-8"))
     prompt = doc["appendSystemPrompt"]
     assert "分工" in prompt and "不亲自" in prompt
     # kimi 壳同源 role_text(ctrl_session 块)
     home_k = tmp_path / "hk"
     wizard.init_bootstrap(home=str(home_k), shell="kimi")
-    doc_k = json.loads((home_k / "settings-controller.json")
+    doc_k = json.loads((injected_dir() / "settings-controller.json")
                        .read_text(encoding="utf-8"))
     assert "分工" in doc_k["ctrl_session"]["role_text"]
     assert "不亲自" in doc_k["ctrl_session"]["role_text"]
@@ -235,17 +235,17 @@ def test_start_cli_smoke(monkeypatch, tmp_path):
     assert "工作目录" in r.output
     # 账本与身份真的建了;总控壳未定=未配置
     assert (tmp_path / "ledger.db").exists()
-    assert (tmp_path / "ctrl-secret.txt").exists()
+    assert (injected_dir() / "ctrl-secret.txt").exists()
     c = connect()
     row = c.execute("SELECT shell, model FROM instances WHERE name='总控'"
                     ).fetchone()
     assert row["shell"] == "未配置"
     c.close()
     # 重跑幂等: secret 不轮换(从 ctrl-secret.txt 读回)
-    s1 = (tmp_path / "ctrl-secret.txt").read_text(encoding="utf-8").strip()
+    s1 = (injected_dir() / "ctrl-secret.txt").read_text(encoding="utf-8").strip()
     r2 = CliRunner().invoke(app, ["start", "--no-browser"], input="\n")
     assert r2.exit_code == 0, r2.output
-    assert (tmp_path / "ctrl-secret.txt").read_text(encoding="utf-8").strip() == s1
+    assert (injected_dir() / "ctrl-secret.txt").read_text(encoding="utf-8").strip() == s1
 
 
 def test_start_cli_workdir_prompt_custom(monkeypatch, tmp_path):

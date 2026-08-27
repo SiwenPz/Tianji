@@ -844,8 +844,8 @@ def _launch_console(shell: str = "claude", print_only: bool = False,
     import json as _json
     import shutil as _sh
     import subprocess as _sp
-    from .db import tianji_home
-    settings = tianji_home() / "settings-controller.json"
+    from .db import injected_dir, tianji_home
+    settings = injected_dir() / "settings-controller.json"
     if not settings.exists():
         _out({"error": f"{settings} 不存在,先跑 tianji init"})
         return

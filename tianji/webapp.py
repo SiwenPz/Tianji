@@ -27,7 +27,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from tianji import ctrlprotocols
 from tianji.ctrlprotocols import BaseBackend, get_backend_class
 from . import cockpit, ctrlsession, integrations, ops, permission, wizard
-from .db import connect, tianji_home
+from .db import connect, injected_dir, tianji_home
 
 app = FastAPI(title="天机驾驶舱", docs_url=None, redoc_url=None)
 
@@ -355,7 +355,7 @@ _ctrl_cfg_mtime: float = 0.0
 
 def _read_ctrl_secret() -> str:
     """读总控身份 secret(从 ctrl-secret.txt,延迟解析路径)。"""
-    p = tianji_home() / "ctrl-secret.txt"
+    p = injected_dir() / "ctrl-secret.txt"
     if p.exists():
         return p.read_text(encoding="utf-8").strip()
     return ""
@@ -373,14 +373,14 @@ def _ctrl() -> BaseBackend:
         # 仅 BaseBackend 实例才做 mtime 变更检测(热生效)。
         if not isinstance(_ctrl_session, BaseBackend):
             return _ctrl_session
-        settings = tianji_home() / "settings-controller.json"
+        settings = injected_dir() / "settings-controller.json"
         mtime = (settings.stat().st_mtime if settings.exists() else 0.0)
         if mtime == _ctrl_cfg_mtime:
             return _ctrl_session
         _ctrl_session.close()
-    settings = tianji_home() / "settings-controller.json"
+    settings = injected_dir() / "settings-controller.json"
     mtime = settings.stat().st_mtime if settings.exists() else 0.0
-    _ctrl_session = BaseBackend.from_config(tianji_home(), settings)
+    _ctrl_session = BaseBackend.from_config(injected_dir(), settings)
     # 票 40: 总控会话 cwd=默认项目目录(configs default_project_dir),
     # 有值则子进程在用户工作目录里启动(改项目文件不撞权限墙);无则账本根=旧行为
     if isinstance(_ctrl_session, BaseBackend):
@@ -569,7 +569,7 @@ def _register_card_entries(conn, ident, home_p: Path, card: dict,
                     ).fetchone() is None:
         integrations.register_credential(
             conn, ident, key_name, pname,
-            key_ref=str(home_p / "keys" / f"{key_name}.key"),
+            key_ref=str(injected_dir() / f"{key_name}.key"),
             request_id="web-card-credential-"
                        + _request_digest(key_name, pname))
 
@@ -641,7 +641,7 @@ async def api_setup_controller(req: Request):
             card.update(key_value=body["key"], base_url=body["base_url"].strip(),
                         key_name=(body.get("key_name") or "").strip() or "主key")
         res = wizard.land_cards(conn, home_p, ident, [card])
-        secret = (home_p / "ctrl-secret.txt").read_text(
+        secret = (injected_dir() / "ctrl-secret.txt").read_text(
             encoding="utf-8").strip()
         # provider 信息统一构造;_write_controller_settings 读壳条目 provider_env
         # 决定凭据映射位置(settings_env / process_env)

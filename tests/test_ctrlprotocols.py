@@ -15,6 +15,7 @@ import time
 import pytest
 
 from tianji import ctrlprotocols
+from tianji.db import injected_dir
 
 
 # ===================================================================
@@ -198,7 +199,8 @@ def acp_home(tmp_path, monkeypatch):
     kimi_home = tmp_path / "fake-kimi-code"
     kimi_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("KIMI_CODE_HOME", str(kimi_home))
-    (home / "ctrl-secret.txt").write_text("test-secret-abc", encoding="utf-8")
+    injected_dir().mkdir(parents=True, exist_ok=True)
+    (injected_dir() / "ctrl-secret.txt").write_text("test-secret-abc", encoding="utf-8")
     return home
 
 

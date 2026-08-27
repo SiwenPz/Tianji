@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from tianji import ctrlprotocols
 from tianji.ctrlprotocols import ACPBackend, BaseBackend, ClaudeStreamBackend, get_backend_class
+from tianji.db import injected_dir
 
 # --- fixture: dummy tianji_home with settings ---
 
@@ -29,7 +30,8 @@ def fake_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("TIANJI_HOME", str(home))
-    (home / "ctrl-secret.txt").write_text("test-secret", encoding="utf-8")
+    injected_dir().mkdir(parents=True, exist_ok=True)
+    (injected_dir() / "ctrl-secret.txt").write_text("test-secret", encoding="utf-8")
     return home
 
 
@@ -39,7 +41,7 @@ def _write_claude_settings(home: Path):
                 "TIANJI_SECRET": "test-secret"},
         "appendSystemPrompt": "你是总控",
     }
-    (home / "settings-controller.json").write_text(
+    (injected_dir() / "settings-controller.json").write_text(
         json.dumps(doc, ensure_ascii=False), encoding="utf-8")
 
 
@@ -66,7 +68,7 @@ def _write_kimi_settings(home: Path):
             "role_text": "你是kimi总控",
         },
     }
-    (home / "settings-controller.json").write_text(
+    (injected_dir() / "settings-controller.json").write_text(
         json.dumps(doc, ensure_ascii=False), encoding="utf-8")
 
 
@@ -89,12 +91,12 @@ def _write_acp_settings(home: Path, shell: str = "fake-acp"):
             "role_text": "你是假壳总控",
         },
     }
-    (home / "settings-controller.json").write_text(
+    (injected_dir() / "settings-controller.json").write_text(
         json.dumps(doc, ensure_ascii=False), encoding="utf-8")
 
 
 def _write_empty_settings(home: Path):
-    (home / "settings-controller.json").write_text(
+    (injected_dir() / "settings-controller.json").write_text(
         json.dumps({}, ensure_ascii=False), encoding="utf-8")
 
 
@@ -106,7 +108,7 @@ def _write_empty_settings(home: Path):
 class TestBackendFromConfig:
     def test_claude_settings_produces_claude_backend(self, fake_home):
         _write_claude_settings(fake_home)
-        settings = fake_home / "settings-controller.json"
+        settings = injected_dir() / "settings-controller.json"
         b = BaseBackend.from_config(fake_home, settings)
         assert isinstance(b, ClaudeStreamBackend)
         assert b.home == fake_home
@@ -115,7 +117,7 @@ class TestBackendFromConfig:
 
     def test_kimi_settings_produces_acp_backend(self, fake_home):
         _write_kimi_settings(fake_home)
-        settings = fake_home / "settings-controller.json"
+        settings = injected_dir() / "settings-controller.json"
         b = BaseBackend.from_config(fake_home, settings)
         assert isinstance(b, ACPBackend)
         assert b.home == fake_home
@@ -134,7 +136,7 @@ class TestBackendFromConfig:
 
     def test_empty_settings_falls_back_to_base(self, fake_home):
         _write_empty_settings(fake_home)
-        settings = fake_home / "settings-controller.json"
+        settings = injected_dir() / "settings-controller.json"
         b = BaseBackend.from_config(fake_home, settings)
         assert type(b) is BaseBackend  # exact BaseBackend, not ClaudeStreamBackend
 
@@ -145,16 +147,16 @@ class TestBackendFromConfig:
 
     def test_unknown_protocol_falls_back(self, fake_home):
         doc = {"ctrl_session": {"protocol": "unknown-protocol"}}
-        (fake_home / "settings-controller.json").write_text(
+        (injected_dir() / "settings-controller.json").write_text(
             json.dumps(doc, ensure_ascii=False), encoding="utf-8")
         b = BaseBackend.from_config(
-            fake_home, fake_home / "settings-controller.json")
+            fake_home, injected_dir() / "settings-controller.json")
         assert type(b) is BaseBackend
 
     def test_claude_no_ctrl_session_block(self, fake_home):
         """claude settings 含 env 但无 ctrl_session 块 → 默认 stream-json。"""
         _write_claude_settings(fake_home)
-        settings = fake_home / "settings-controller.json"
+        settings = injected_dir() / "settings-controller.json"
         b = BaseBackend.from_config(fake_home, settings)
         assert isinstance(b, ClaudeStreamBackend)
 
@@ -269,7 +271,7 @@ class TestWizardControllerSettings:
             home_p=sub, home=str(sub), shell="kimi", secret="s",
             provider={"model": "m", "base_url": "https://x", "key_name": "k"},
             ready=True, cards=[])
-        doc = json.loads((sub / "settings-controller.json").read_text(encoding="utf-8"))
+        doc = json.loads((injected_dir() / "settings-controller.json").read_text(encoding="utf-8"))
         cs = doc["ctrl_session"]
         assert cs["protocol"] == "acp"
         assert cs["launch"] == ["kimi", "acp"]
@@ -295,7 +297,7 @@ class TestPluginCtrlSession:
         wizard.SHELL_ENTRY_DEFAULTS["fake-acp"] = fake_entry
         try:
             _write_acp_settings(fake_home, "fake-acp")
-            settings = fake_home / "settings-controller.json"
+            settings = injected_dir() / "settings-controller.json"
             b = BaseBackend.from_config(fake_home, settings)
             assert isinstance(b, ACPBackend)
             # launch 来自 settings 文件(条目数据优先,不硬编码)
@@ -313,7 +315,7 @@ class TestPluginCtrlSession:
         wizard._write_controller_settings(
             home_p=fake_home, home=str(fake_home), shell="codex",
             secret="s")
-        doc = json.loads((fake_home / "settings-controller.json").read_text(
+        doc = json.loads((injected_dir() / "settings-controller.json").read_text(
             encoding="utf-8"))
         assert "ctrl_session" not in doc
         assert "appendSystemPrompt" in doc
