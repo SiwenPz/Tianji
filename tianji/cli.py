@@ -10,7 +10,7 @@ from pathlib import Path
 
 import typer
 
-from . import auth, daemon, events, integrations, messages, ops, permission, plugins, render, wizard
+from . import auth, daemon, events, integrations, messages, ops, permission, plugins, pool as pool_mod, render, wizard
 from .db import connect, now, tx
 from .cockpit import render_snapshot, snapshot
 
@@ -805,6 +805,74 @@ def plugin_render(name: str):
 def plugin_reconcile(name: str):
     """对账(21.4 三态指纹): 缺失/旧版→机械重生成;用户改过→不碰+升级。"""
     _out(plugins.reconcile(_conn(), name))
+
+
+pool_app = typer.Typer(help="号池管理(票 55)")
+app.add_typer(pool_app, name="pool")
+
+
+@pool_app.command("create")
+def pool_create(name: str,
+                members: str = typer.Option(
+                    "", "--members",
+                    help="逗号分隔的 credential 名称列表"),
+                circuit: str = typer.Option(
+                    "{}", "--circuit",
+                    help="熔断参数覆盖(JSON 对象,空={}=用默认)"),
+                request_id: str = typer.Option(None, "--request-id")):
+    """建池(总控+审计+幂等): token 明文仅此一次输出。"""
+    member_list = [m.strip() for m in members.split(",") if m.strip()] if members else []
+    try:
+        circuit_dict = json.loads(circuit) if circuit else {}
+    except json.JSONDecodeError as e:
+        raise typer.BadParameter(f"circuit 非法 JSON: {e}")
+    _out(pool_mod.pool_create(
+        _conn(), _ident(), name, members=member_list,
+        circuit=circuit_dict, request_id=request_id))
+
+
+@pool_app.command("add-member")
+def pool_add_member(name: str, credential: str,
+                    request_id: str = typer.Option(None, "--request-id")):
+    """加成员(总控+审计+幂等): credential 须已在集成注册表中登记。"""
+    _out(pool_mod.pool_add_member(
+        _conn(), _ident(), name, credential, request_id=request_id))
+
+
+@pool_app.command("remove-member")
+def pool_remove_member(name: str, credential: str,
+                       request_id: str = typer.Option(None, "--request-id")):
+    """摘成员(总控+审计+幂等): 摘光最后一人给出警告。"""
+    _out(pool_mod.pool_remove_member(
+        _conn(), _ident(), name, credential, request_id=request_id))
+
+
+@pool_app.command("list")
+def pool_list():
+    """列出全部池(只读)。"""
+    _out(pool_mod.pool_list(_conn()))
+
+
+@pool_app.command("status")
+def pool_status(name: str):
+    """查池详情+令牌状态(只读)。"""
+    _out(pool_mod.pool_status(_conn(), name))
+
+
+@pool_app.command("rotate-token")
+def pool_rotate_token(name: str,
+                      request_id: str = typer.Option(None, "--request-id")):
+    """令牌轮换(总控+审计+幂等): 生成新 token,旧 token 作废。明文仅此一次。"""
+    _out(pool_mod.pool_rotate_token(
+        _conn(), _ident(), name, request_id=request_id))
+
+
+@pool_app.command("delete")
+def pool_delete(name: str,
+                request_id: str = typer.Option(None, "--request-id")):
+    """删池(总控+审计+幂等): 同时删除池配置和 token。"""
+    _out(pool_mod.pool_delete(
+        _conn(), _ident(), name, request_id=request_id))
 
 
 if __name__ == "__main__":
