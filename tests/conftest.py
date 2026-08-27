@@ -1,9 +1,26 @@
 """测试夹具: 每测试独立 TIANJI_HOME(临时目录),预置总控+实施者实例。"""
 
+import os
+import sys
+
 import pytest
 
 from tianji import ops
 from tianji.db import connect
+
+
+def pytest_configure(config):
+    """Windows 沙箱兼容: os.mkdir(mode=0o700) 创建过严 ACL 导致
+    TempPathFactory 的 tmpdir 操作失败. 忽略 mode 参数, 因为 Windows
+    上 mode 只影响 readonly 位, 而 0o700 被 Python 转换为过严的 ACL.
+    """
+    if os.name == "nt":
+        original_mkdir = os.mkdir
+
+        def _mkdir_nowinacl(path, mode=0o777, *, dir_fd=None):
+            return original_mkdir(path, dir_fd=dir_fd)
+
+        os.mkdir = _mkdir_nowinacl
 
 
 @pytest.fixture
