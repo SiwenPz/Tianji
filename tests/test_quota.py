@@ -113,3 +113,157 @@ def test_quota_visible_in_cockpit(conn, controller):
              for c in cl if isinstance(c, dict)]
     card = [c for c in cards if c["instance_name"] == "见工"][0]
     assert card["quota_pct"] == 66
+
+
+# ====================================================================
+# 票 48: 死代码接线(14.1②③)与 13.1 上下文窗口读取侧
+# ====================================================================
+
+def test_transcript_usage_scan_skips_unchanged(conn, controller, tmp_path):
+    """票48(14.1②): 尺寸守卫——文件没长过不重扫;追加后重扫补上不翻倍。"""
+    tr = tmp_path / "t.jsonl"
+    tr.write_text(json.dumps({"usage": {"input_tokens": 10,
+                                        "output_tokens": 5}}) + "\n",
+                  encoding="utf-8")
+    r1 = quota.scan_transcript_usage(conn, "报工", str(tr))
+    assert r1["usage"]["input_tokens"] == 10
+    r2 = quota.scan_transcript_usage(conn, "报工", str(tr))
+    assert r2["unchanged"] is True and r2["usage"]["input_tokens"] == 10
+    with open(tr, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"usage": {"input_tokens": 7,
+                                      "output_tokens": 3}}) + "\n")
+    r3 = quota.scan_transcript_usage(conn, "报工", str(tr))
+    assert r3["usage"]["input_tokens"] == 17  # 重扫=全量重算,不翻倍
+
+
+def test_monitor_scan_wires_transcript_usage(conn, controller, tmp_path,
+                                             monkeypatch):
+    """票48(14.1②): 巡检顺带累加转录 usage——壳声明 transcript 且登记过会话。
+
+    假象消除证明: 之前 scan_transcript_usage 全仓无调用方,这里证明
+    monitor_scan 会把转录 usage 落进该实例的额度账本。
+    """
+    ops.instance_register(conn, "转录工", "dsh", "deepseek-v4-flash",
+                          context_window=100000)
+    # dsh 转录根=DSH_HOME 环境变量;glob: sessions/*/{session_id}/session.jsonl
+    home = tmp_path / "dsh-home"
+    tr = home / "sessions" / "t1" / "sess-01" / "session.jsonl"
+    tr.parent.mkdir(parents=True)
+    tr.write_text(
+        json.dumps({"message": {"usage": {"input_tokens": 100,
+                                          "output_tokens": 40}}}) + "\n"
+        + json.dumps({"usage": {"input_tokens": 60, "output_tokens": 10}}) + "\n",
+        encoding="utf-8")
+    monkeypatch.setenv("DSH_HOME", str(home))
+    conn.execute(
+        "INSERT INTO instance_registrations"
+        " (instance_name, dispatch_id, status, dcap_hash, session_id, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        ("转录工", 0, "active", "h", "sess-01", ops.now()))
+    quota.monitor_scan(conn)
+    d = quota._load(conn, "转录工")
+    assert d["usage"]["input_tokens"] == 160
+    assert d["usage"]["output_tokens"] == 50
+
+
+def test_monitor_scan_wires_ccswitch(conn, controller, tmp_path):
+    """票48(14.1③): 配了 cc-switch 库路径后,巡检读账目+错误码归类写档案。
+
+    429→exhausted(暂停派新活的消费侧在 allocator_pick);补读
+    usage_daily_rollups/provider_health 两张表,缺表如实报 absent。
+    """
+    _reg(conn, "账目工", window=100000)  # claude: 声明 transcript+ccswitch 层
+    db = tmp_path / "cc.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE proxy_request_logs (status_code INTEGER)")
+    c.executemany("INSERT INTO proxy_request_logs VALUES (?)",
+                  [(200,), (429,)])
+    c.execute("CREATE TABLE usage_daily_rollups"
+              " (day TEXT, input_tokens INTEGER, output_tokens INTEGER)")
+    c.execute("INSERT INTO usage_daily_rollups VALUES" " ('2026-08-01', 500, 100)")
+    c.execute("CREATE TABLE provider_health (provider TEXT, healthy INTEGER)")
+    c.execute("INSERT INTO provider_health VALUES ('kimi', 1)")
+    c.commit()
+    c.close()
+    ops.config_set(conn, controller, "ccswitch_db_path", str(db),
+                   request_id="cc-db")
+    quota.monitor_scan(conn)
+    d = quota._load(conn, "账目工")
+    assert d["exhausted"] is True
+    cc = d["ccswitch"]
+    # 账本 blob 经 JSON 往返,status_code 键是字符串(直读返回里才是 int 键)
+    assert cc["proxy_request_logs"]["429"]["class"] == "限流"
+    assert cc["usage_daily_rollups"]["present"] is True
+    assert cc["usage_daily_rollups"]["input_tokens"] == 500
+    assert cc["provider_health"]["present"] is True
+    notes = conn.execute(
+        "SELECT notes FROM ability_profiles WHERE instance_name='账目工'"
+    ).fetchone()["notes"]
+    assert "限流" in notes and "非故障" in notes
+
+
+def test_ccswitch_403_classified_not_exhausted(conn, controller, tmp_path):
+    """票48(14.1③): 403=权限/封禁归类写实例档案,但不是额度用尽。"""
+    _reg(conn, "封工")
+    db = tmp_path / "c403.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE proxy_request_logs (status_code INTEGER)")
+    c.executemany("INSERT INTO proxy_request_logs VALUES (?)", [(403,), (403,)])
+    c.commit()
+    c.close()
+    r = quota.read_ccswitch(conn, str(db), "封工")
+    assert r["summary"][403]["class"] == "权限/封禁"
+    notes = conn.execute(
+        "SELECT notes FROM ability_profiles WHERE instance_name='封工'"
+    ).fetchone()["notes"]
+    assert "权限/封禁" in notes and "非限流" in notes
+    assert quota.context_health(conn, "封工")["exhausted"] is False
+
+
+def test_instance_register_fills_context_window_from_key(conn, controller):
+    """票48(13.1 读取侧): 探测缓存里的上下文窗口在实例注册时带出,
+    14.2 健康度与 9.2 硬过滤读的 ability_profiles.context_window 因此有值。
+    """
+    ops.config_set(conn, controller, "shell:codex", json.dumps(
+        {"binding": "env", "protocols": ["openai_chat"]},
+        ensure_ascii=False), request_id="cw-shell")
+    ops.config_set(conn, controller, "key:kk", json.dumps({
+        "base_url": "https://api.example/v1", "protocol": "openai_chat",
+        "models": [{"id": "m1", "context_window": 8000},
+                   {"id": "m2", "context_window": None,
+                    "context_window_status": "待实测"}],
+    }, ensure_ascii=False), request_id="cw-key")
+    ops.instance_register(conn, "窗工", "codex", "m1", key_name="kk")
+    prof = conn.execute(
+        "SELECT context_window FROM ability_profiles"
+        " WHERE instance_name='窗工'").fetchone()
+    assert prof["context_window"] == 8000
+    # 待实测模型: 拿不到数→保持 0=如实未知,不瞎填
+    ops.instance_register(conn, "窗工2", "codex", "m2", key_name="kk")
+    prof2 = conn.execute(
+        "SELECT context_window FROM ability_profiles"
+        " WHERE instance_name='窗工2'").fetchone()
+    assert prof2["context_window"] == 0
+
+
+def test_instance_register_fills_window_from_provider_entry(conn, controller):
+    """票48(13.1): 集成注册表路径同样带出——credential→供应商条目→models。"""
+    ops.config_set(conn, controller, "shell:codex", json.dumps(
+        {"binding": "env", "protocols": ["openai_chat"]},
+        ensure_ascii=False), request_id="cw-shell2")
+    ops.config_set(conn, controller, "key:kk2", json.dumps({
+        "base_url": "https://api.example/v1", "protocol": "openai_chat",
+        "models": [{"id": "pm"}],
+    }, ensure_ascii=False), request_id="cw-key2")
+    ops.config_set(conn, controller, "integration_provider:rp", json.dumps({
+        "base_url": "https://rp.example/v1", "protocol": "openai_chat",
+        "models": [{"id": "pm", "context_window": 16000}],
+    }, ensure_ascii=False), request_id="cw-prov")
+    ops.config_set(conn, controller, "credential:kk2", json.dumps({
+        "provider": "rp", "key_ref": "x.key"}, ensure_ascii=False),
+        request_id="cw-cred")
+    ops.instance_register(conn, "窗工3", "codex", "pm", key_name="kk2")
+    prof = conn.execute(
+        "SELECT context_window FROM ability_profiles"
+        " WHERE instance_name='窗工3'").fetchone()
+    assert prof["context_window"] == 16000

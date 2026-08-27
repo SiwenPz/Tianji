@@ -238,7 +238,8 @@ def add_instance(conn, ident, name, shell, model, key_name="",
                 raise ValueError(f"key 条目 {key_name} 不存在且未给 base_url")
             ops.config_set(conn, ident, f"key:{key_name}", json.dumps({
                 "base_url": base_url,
-                "models": [{"id": model, "display": model}],
+                "models": [integrations.model_entry({"id": model,
+                                                     "display": model})],
                 "protocol": protocol or "openai",
                 "key_ref": key_ref or None,
                 "coding_plan": False}, ensure_ascii=False),
@@ -467,8 +468,9 @@ def land_cards(conn, home_p: Path, ident: dict, cards: list) -> dict:
             models = []
             if krow is not None:
                 models = json.loads(krow["value"]).get("models", [])
-            if model and all(m.get("id") != model for m in models):
-                models.append({"id": model, "display": model})
+            if model and all((m or {}).get("id") != model for m in models):
+                models.append(integrations.model_entry(
+                    {"id": model, "display": model}))
             conn.execute(
                 "INSERT OR REPLACE INTO configs (key, value, updated_at)"
                 " VALUES (?,?,?)",
@@ -580,7 +582,8 @@ def init_bootstrap(home: str = "", shell: str = "claude", model: str = "",
             " VALUES (?,?,?)",
             (f"key:{key_name}", json.dumps({
                 "base_url": base_url,
-                "models": [{"id": model, "display": model}] if model else [],
+                "models": [integrations.model_entry({"id": model, "display": model})]
+                    if model else [],
                 "protocol": protocol, "key_ref": key_ref,
                 "coding_plan": False}, ensure_ascii=False), now()))
         out["steps"].append(f"key 条目 {key_name} 已建/更新")

@@ -1,4 +1,4 @@
-﻿"""Integration registry for reusable provider, protocol, and shell entries."""
+"""Integration registry for reusable provider, protocol, and shell entries."""
 
 from __future__ import annotations
 
@@ -171,6 +171,49 @@ _AUTH_HEADERS = {
 }
 
 
+def _probe_context_window(raw: dict) -> "int | None":
+    """从供应商 /v1/models 返回的模型原始数据里尝试提取上下文窗口(13.1)。
+
+    常见字段名都认;不认识就返回 None=探测不到,标"待实测"。
+    """
+    for f in ("context_window", "context_length", "ctx_len",
+              "context_window_size", "max_context_length"):
+        v = raw.get(f)
+        if isinstance(v, int) and v > 0:
+            return v
+        if isinstance(v, str) and v.strip().isdigit():
+            return int(v.strip())
+    return None
+
+
+def model_entry(raw, context_window: "int | None" = None,
+                display=None, pending_test=None) -> dict:
+    """模型条目归一(13.1,票 48): 保证每条带 context_window 字段。
+
+    探测(discover)可得就填数值,探测不到标"待实测";display/pending_test
+    保留原有语义(人工补录=待实测模型)。所有写模型条目的地方统一走这里,
+    避免两处漂移。
+    """
+    if isinstance(raw, dict):
+        m = {"id": raw.get("id")}
+        if context_window is None:
+            context_window = _probe_context_window(raw)
+        if display is None:
+            display = raw.get("display")
+        if pending_test is None:
+            pending_test = raw.get("pending_test")
+    else:
+        m = {"id": str(raw)}
+    m["context_window"] = context_window
+    if context_window is None:
+        m["context_window_status"] = "待实测"
+    if display is not None:
+        m["display"] = display
+    if pending_test is not None:
+        m["pending_test"] = pending_test
+    return m
+
+
 def discover_models(conn, ident=None, provider="", base_url="", protocol="",
                     credential="", key_value="", key_ref="", timeout=10):
     """标准模型发现(13.8/票33): 按供应商条目的协议取端点候选与认证方式,
@@ -245,7 +288,10 @@ def discover_models(conn, ident=None, provider="", base_url="", protocol="",
                             "模型缓存写入仅总控身份可执行")
                     with tx(conn) as c:
                         cur = _config(c, f"integration_provider:{provider}")
-                        cur["models"] = [{"id": i} for i in ids]
+                        # 13.1: 探测时顺带提取上下文窗口,拿不到标"待实测"
+                        cur["models"] = [model_entry(m) for m in
+                                         data.get("data", [])
+                                         if isinstance(m, dict) and m.get("id")]
                         cur["discovered_at"] = now()
                         cur["discovery_source"] = source
                         _write_entry(c, ident,
@@ -279,7 +325,7 @@ def add_provider_model(conn, ident, provider, model_id, request_id=None):
                 raise ValueError(
                     f"模型 {model_id} 已在 {provider} 清单里(刷新缓存即可)")
             entry.setdefault("models", []).append(
-                {"id": model_id, "pending_test": True})
+                model_entry({"id": model_id}, pending_test=True))
             _write_entry(c, ident, f"integration_provider:{provider}",
                          entry, request_id)
             ops.audit(c, "integration_model_add", {
@@ -595,7 +641,13 @@ def migrate_legacy_entries(conn, ident, request_id=None):
                     current["key_ref"] = cfg.get("key_ref")
                     models = cfg.get("models", [])
                     if models:
-                        current["models"] = models
+                        # 13.1(票 48): 迁移时归一模型条目,保证带 context_window
+                        # 字段(旧数据没有探测值→标"待实测")
+                        current["models"] = [
+                            model_entry(m) if isinstance(m, dict) else
+                            {"id": str(m), "context_window": None,
+                             "context_window_status": "待实测"}
+                            for m in models]
                         current["discovered_at"] = now()
                     _write_entry(c, ident, target, current,
                                  f"{request_id}-{legacy_key}")
