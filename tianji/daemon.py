@@ -1,8 +1,8 @@
 
-"""天机 daemon(18.2/18.3/7.1): start/stop/status 统一拉起监控器+驾驶舱Web,崩溃自动重拉,每日备份。
+"""天机 daemon(18.2/18.3/7.1): start/stop/status 统一拉起监控器+驾驶舱Web+号池Proxy,崩溃自动重拉,每日备份。
 
-设计: daemon start 拉起 supervisor(detached),supervisor 再拉起 monitor + web
-两常驻子进程并守护探活,任一死则自动重拉+审计行;每日备份由监控器巡检顺带
+设计: daemon start 拉起 supervisor(detached),supervisor 再拉起 monitor + web + proxy
+三常驻子进程并守护探活,任一死则自动重拉+审计行;每日备份由监控器巡检顺带
 (18.5)。stop 全部停止。常驻进程无状态(7.1:运行知识全在账本,不写共享文件)。
 """
 
@@ -77,10 +77,20 @@ def _spawn_monitor(interval):
 
 
 def _spawn_web(port):
-    """拉起驾驶舱 Web 子进程(18.2 常驻之二)。cwd 固定到账本根(同 _spawn_monitor)。"""
+    """拉起驾驶舱 Web 子进程(18.2 常驻之一)。cwd 固定到账本根(同 _spawn_monitor)。"""
     log = open(tianji_home() / "web.log", "ab")
     return subprocess.Popen(
         [sys.executable, "-m", "tianji", "web", "--port", str(port)],
+        stdout=log, stderr=subprocess.STDOUT, creationflags=_win_flags(),
+        cwd=str(tianji_home()), env=_child_env())
+
+
+def _spawn_proxy(port):
+    """拉起号池 proxy 子进程(常驻之三)。cwd 固定到账本根(同 spawn_monitor)。"""
+    log = open(tianji_home() / "proxy.log", "ab")
+    return subprocess.Popen(
+        [sys.executable, "-m", "tianji", "proxy", "run",
+         "--port", str(port)],
         stdout=log, stderr=subprocess.STDOUT, creationflags=_win_flags(),
         cwd=str(tianji_home()), env=_child_env())
 
@@ -134,45 +144,60 @@ def _find_free_port(start: int = WEB_PORT_DEFAULT) -> int:
 
 
 def run_daemon(interval: int = 30, web_port: int = WEB_PORT_DEFAULT):
-    """supervisor 主循环(被 daemon start 后台拉起): 拉两常驻+守护探活。
+    """supervisor 主循环(被 daemon start 后台拉起): 拉三常驻+守护探活。
 
     无状态(7.1): 运行知识全在账本 configs,重启不丢;不写共享文件;
-    监控器/驾驶舱任一死 → 自动重拉 + 审计行(7.1 监控器重启)。
+    监控器/驾驶舱/proxy 任一死 → 自动重拉 + 审计行(7.1 监控器重启)。
     """
     conn = connect()
     ops.ensure_defaults(conn)
-    port = _find_free_port(web_port)
+    # 端口冲突顺延(web 起,proxy 起下一个)
+    web = _find_free_port(web_port)
+    proxy = _find_free_port(max(web + 1, web_port))
+    _cfg_set(conn, "daemon.web_port", str(web))
+    _cfg_set(conn, "daemon.proxy_port", str(proxy))
     _cfg_set(conn, "daemon.pid", str(os.getpid()))
-    _cfg_set(conn, "daemon.web_port", str(port))
     _cfg_set(conn, "daemon.started_at", str(now()))
     mon = _spawn_monitor(interval)
-    web = _spawn_web(port)
+    web_proc = _spawn_web(web)
+    proxy_proc = _spawn_proxy(proxy)
     _cfg_set(conn, "daemon.monitor_pid", str(mon.pid))
-    _cfg_set(conn, "daemon.web_pid", str(web.pid))
+    _cfg_set(conn, "daemon.web_pid", str(web_proc.pid))
+    _cfg_set(conn, "daemon.proxy_pid", str(proxy_proc.pid))
     ops.audit(conn, "daemon_start",
-              {"monitor_pid": mon.pid, "web_pid": web.pid, "web_port": port})
-    print(f"daemon 启动: monitor={mon.pid} web={web.pid} 端口={port}", flush=True)
+              {"monitor_pid": mon.pid, "web_pid": web_proc.pid,
+               "proxy_pid": proxy_proc.pid, "web_port": web,
+               "proxy_port": proxy})
+    print("daemon 启动: monitor={} web={} proxy={} 端口={}/{}".format(
+        mon.pid, web_proc.pid, proxy_proc.pid, web, proxy), flush=True)
     try:
         while True:
-            # 探活间隔复用 interval(默认 30s,分钟级守护探活 7.1)
             time.sleep(max(1, interval))
             if not _pid_alive(mon.pid):
                 ops.audit(conn, "monitor_restart",
                           {"old_pid": mon.pid, "ts": now()})
                 mon = _spawn_monitor(interval)
                 _cfg_set(conn, "daemon.monitor_pid", str(mon.pid))
-                print(f"监控器重启: {mon.pid}", flush=True)
-            if not _pid_alive(web.pid):
+                print("监控器重启: {}".format(mon.pid), flush=True)
+            if not _pid_alive(web_proc.pid):
                 ops.audit(conn, "web_restart",
-                          {"old_pid": web.pid, "ts": now()})
-                web = _spawn_web(port)
-                _cfg_set(conn, "daemon.web_pid", str(web.pid))
-                print(f"Web 重启: {web.pid}", flush=True)
+                          {"old_pid": web_proc.pid, "ts": now()})
+                web_proc = _spawn_web(web)
+                _cfg_set(conn, "daemon.web_pid", str(web_proc.pid))
+                print("Web 重启: {}".format(web_proc.pid), flush=True)
+            if not _pid_alive(proxy_proc.pid):
+                ops.audit(conn, "proxy_restart",
+                          {"old_pid": proxy_proc.pid, "ts": now()})
+                proxy_proc = _spawn_proxy(proxy)
+                _cfg_set(conn, "daemon.proxy_pid", str(proxy_proc.pid))
+                print("Proxy 重启: {}".format(proxy_proc.pid), flush=True)
     finally:
         _terminate(mon)
-        _terminate(web)
+        _terminate(web_proc)
+        _terminate(proxy_proc)
         for key in ("daemon.pid", "daemon.monitor_pid", "daemon.web_pid",
-                    "daemon.web_port", "daemon.started_at"):
+                    "daemon.proxy_pid", "daemon.web_port", "daemon.proxy_port",
+                    "daemon.started_at"):
             try:
                 conn.execute("DELETE FROM configs WHERE key=?", (key,))
             except sqlite3.Error:
@@ -181,7 +206,7 @@ def run_daemon(interval: int = 30, web_port: int = WEB_PORT_DEFAULT):
 
 
 def daemon_start(interval: int = 30, web_port: int = WEB_PORT_DEFAULT):
-    """`daemon start`: 后台拉起 supervisor,supervisor 再拉起 monitor+web 两常驻。
+    """`daemon start`: 后台拉起 supervisor,supervisor 再拉起 monitor+web+proxy 三常驻。
 
     返回后 status 即可见(等待 supervisor 写入 web_port)。不做电脑登录自启(18.3)。
     """
@@ -201,35 +226,43 @@ def daemon_start(interval: int = 30, web_port: int = WEB_PORT_DEFAULT):
             break
         time.sleep(0.2)
     return {"ok": True, "daemon_pid": proc.pid,
-            "web_port": _cfg_get(conn, "daemon.web_port") or web_port}
+            "web_port": int(_cfg_get(conn, "daemon.web_port") or web_port),
+            "proxy_port": int(_cfg_get(conn, "daemon.proxy_port") or 0)}
 
 
 def daemon_stop():
-    """`daemon stop`: 停 supervisor+monitor+web 全部常驻,清 configs 状态。"""
+    """`daemon stop`: 停 supervisor+monitor+web+proxy 全部常驻,清 configs 状态。"""
     conn = connect()
     ops.ensure_defaults(conn)
     mon_pid = int(_cfg_get(conn, "daemon.monitor_pid") or 0)
     web_pid = int(_cfg_get(conn, "daemon.web_pid") or 0)
+    proxy_pid = int(_cfg_get(conn, "daemon.proxy_pid") or 0)
     daemon_pid = int(_cfg_get(conn, "daemon.pid") or 0)
+    _kill_pid(proxy_pid)
     _kill_pid(web_pid)
     _kill_pid(mon_pid)
     _kill_pid(daemon_pid)
     for key in ("daemon.pid", "daemon.monitor_pid", "daemon.web_pid",
-                "daemon.web_port", "daemon.started_at"):
-        conn.execute("DELETE FROM configs WHERE key=?", (key,))
+                "daemon.proxy_pid", "daemon.web_port", "daemon.proxy_port",
+                "daemon.started_at"):
+        try:
+            conn.execute("DELETE FROM configs WHERE key=?", (key,))
+        except sqlite3.Error:
+            pass
     ops.audit(conn, "daemon_stop",
-              {"monitor_pid": mon_pid, "web_pid": web_pid})
+              {"monitor_pid": mon_pid, "web_pid": web_pid, "proxy_pid": proxy_pid})
     return {"ok": True, "monitor_pid": mon_pid, "web_pid": web_pid,
-            "daemon_pid": daemon_pid}
+            "proxy_pid": proxy_pid, "daemon_pid": daemon_pid}
 
 
 def daemon_status():
-    """`daemon status`: 三进程活性快照。"""
+    """`daemon status`: 四进程活性快照。"""
     conn = connect()
     ops.ensure_defaults(conn)
     daemon_pid = int(_cfg_get(conn, "daemon.pid") or 0)
     mon_pid = int(_cfg_get(conn, "daemon.monitor_pid") or 0)
     web_pid = int(_cfg_get(conn, "daemon.web_pid") or 0)
+    proxy_pid = int(_cfg_get(conn, "daemon.proxy_pid") or 0)
     return {
         "running": bool(daemon_pid and _pid_alive(daemon_pid)),
         "daemon_pid": daemon_pid,
@@ -237,7 +270,10 @@ def daemon_status():
         "monitor_alive": bool(mon_pid and _pid_alive(mon_pid)),
         "web_pid": web_pid,
         "web_alive": bool(web_pid and _pid_alive(web_pid)),
+        "proxy_pid": proxy_pid,
+        "proxy_alive": bool(proxy_pid and _pid_alive(proxy_pid)),
         "web_port": int(_cfg_get(conn, "daemon.web_port") or 0),
+        "proxy_port": int(_cfg_get(conn, "daemon.proxy_port") or 0),
         "started_at": _cfg_get(conn, "daemon.started_at") or "",
     }
 
