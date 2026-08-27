@@ -47,7 +47,15 @@ def _pid_alive(pid: int) -> bool:
             k32.CloseHandle(h)
     try:
         os.kill(pid, 0)
-        return True
+        # POSIX: 僵尸进程(Z)=已死未收尸,判死(票56实测:supervisor持有Popen不wait,
+        # 子进程死后变僵尸,os.kill(pid,0)仍成功→探活误判→守护不重拉。Windows分支
+        # 的WaitForSingleObject天然正确,不受影响)
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+                state = f.read().rsplit(")", 1)[-1].split()[0]
+            return state != "Z"
+        except (OSError, IndexError):
+            return True
     except OSError:
         return False
 
