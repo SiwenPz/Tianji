@@ -48,7 +48,7 @@ def _require_controller(conn):
 # ---------------------------------------------------------------- 只读数据
 
 def _approvals(conn) -> list:
-    """待审批卡三类: 计划确认/最终确认/权限裁决(15.1③)。"""
+    """待审批卡四类: 计划确认/最终确认/权限裁决/兜底跳转(4.4 HITL)。"""
     cards = []
     for t in conn.execute(
             "SELECT id, title FROM tasks WHERE status='awaiting_plan_confirm'"
@@ -61,6 +61,12 @@ def _approvals(conn) -> list:
     for r in permission.pending(conn):
         cards.append({"kind": "permission", "ruling_id": r["id"],
                       "worker": r["worker_id"], "tool": r["tool"]})
+    for r in ops.pending_force(conn):
+        cards.append({"kind": "force", "approval_id": r["id"],
+                      "task_id": r["task_id"],
+                      "from": r["from_state"], "to": r["to_state"],
+                      "reason": r["reason"],
+                      "initiator": r["initiator_id"]})
     return cards
 
 
@@ -342,6 +348,26 @@ async def api_force(req: Request):
             conn, ident, int(body["task_id"]), body["to_state"],
             body.get("reason", "驾驶舱强制干预"),
             request_id=f"web-force-{ops.now()}")
+    finally:
+        conn.close()
+
+
+@app.post("/api/force/approve")
+async def api_force_approve(req: Request):
+    """兜底跳转人审(HITL): 用户显式批准/驳回,总控身份自批被拒。"""
+    body = await req.json()
+    conn = connect()
+    try:
+        ident = _ident_or_none()
+        if ident and ops.auth.check_controller(conn, ident):
+            return JSONResponse(
+                {"error": "审批必须由用户(人)操作,总控身份不可自批(HITL)"},
+                status_code=403)
+        aid = int(body.get("approval_id"))
+        decision = body.get("decision")
+        if decision == "approve":
+            return ops.force_approve(conn, "cockpit-user", aid)
+        return ops.force_reject(conn, "cockpit-user", aid)
     finally:
         conn.close()
 
@@ -802,6 +828,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .sysline{color:#7e93bd;font-size:12px}
 .thinking{color:#f5a623;font-size:12px}
 .approve-card{background:#22301c;border:1px solid #3d5a2e;border-radius:12px;padding:10px 14px;margin-bottom:8px}
+.approve-card.force{background:#2e2218;border-color:#5a3d2e}
 .esc-card{background:#33181f;border:1px solid #6e2b36;border-radius:12px;padding:10px 14px;margin-bottom:8px}
 .esc-card .ack{text-decoration:underline;cursor:pointer}
 .unread{font-weight:bold}
@@ -905,12 +932,19 @@ function render(d){
  // 审批卡(墨绿)+升级红卡,排在对话流顶部;升级卡补 unread 类(审计缺口 3,未读加粗生效)
  let fh="";
  for(const a of d.approvals){
-  const tag={plan:"计划确认",final:"最终确认",permission:"权限裁决"}[a.kind];
-  const what=a.kind==="permission"?`#${a.ruling_id} ${esc(a.worker)}: ${esc(a.tool)}`:`#${a.task_id} ${esc(a.title)}`;
-  fh+=`<div class="approve-card"><b>[${tag}]</b> ${what}
-  <div style="margin-top:8px;display:flex;gap:8px">
-  <button class="btn-ok" onclick="approve('${a.kind}',${a.kind==="permission"?a.ruling_id:a.task_id},'approve')">✓ 批准</button>
-  <button class="btn-no" onclick="approve('${a.kind}',${a.kind==="permission"?a.ruling_id:a.task_id},'reject')">✗ 驳回</button></div></div>`}
+  if(a.kind==="force"){
+   fh+=`<div class="approve-card force"><b>[兜底跳转]</b> 任务#${a.task_id}: ${esc(a.from)}→${esc(a.to)} ${esc(a.reason||"")}
+   <small style="color:#7e93bd">发起: ${esc(a.initiator)}</small>
+   <div style="margin-top:8px;display:flex;gap:8px">
+   <button class="btn-ok" onclick="approveForce(${a.approval_id},'approve')">✓ 批准</button>
+   <button class="btn-no" onclick="approveForce(${a.approval_id},'reject')">✗ 驳回</button></div></div>`}
+  else{
+   const tag={plan:"计划确认",final:"最终确认",permission:"权限裁决"}[a.kind];
+   const what=a.kind==="permission"?`#${a.ruling_id} ${esc(a.worker)}: ${esc(a.tool)}`:`#${a.task_id} ${esc(a.title)}`;
+   fh+=`<div class="approve-card"><b>[${tag}]</b> ${what}
+   <div style="margin-top:8px;display:flex;gap:8px">
+   <button class="btn-ok" onclick="approve('${a.kind}',${a.kind==="permission"?a.ruling_id:a.task_id},'approve')">✓ 批准</button>
+   <button class="btn-no" onclick="approve('${a.kind}',${a.kind==="permission"?a.ruling_id:a.task_id},'reject')">✗ 驳回</button></div></div>`}}
  for(const e of d.escalations){
   if(dismissedEsc.has(e.seq))continue;
   if(e.recovered)
@@ -922,6 +956,10 @@ function render(d){
 async function approve(kind,id,decision){
  const r=await j("/api/approve",{method:"POST",headers:{"Content-Type":"application/json"},
   body:JSON.stringify({kind,decision,task_id:id,ruling_id:id})});
+ if(r.error)alert(r.error);poll()}
+async function approveForce(approval_id,decision){
+ const r=await j("/api/force/approve",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({approval_id,decision})});
  if(r.error)alert(r.error);poll()}
 /* ===== 右栏 peek: 实例详情 / 角色·条目编制表(两者互斥,切换内容不叠开) ===== */
 function togglePeek(name){

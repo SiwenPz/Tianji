@@ -26,8 +26,9 @@ TASK_TRANSITIONS = {
     "reopened": {"reviewing"},                # 唯一后继;重派计数清零(10.6)
 }
 
-# 强制干预(4.4): 总控 CLI 特权+审计,例外转换不在此表
+# 强制干预(4.4): 三种既定动作直接执行,其余走人审门(HITL)
 FORCE_TARGETS = set(TASK_STATES) - {"new"}
+ESTABLISHED_FORCE_TARGETS = {"archived", "dispatched"}
 
 # 派单七态(5.1);requeue 标记旧派单,新派单=新行(dispatch_id 变化)
 DISPATCH_TRANSITIONS = {

@@ -47,13 +47,12 @@ def test_reopen_only_from_archived(conn, controller):
 
 
 def test_force_intervention(conn, controller, worker):
-    """强制干预(4.4): 总控特权例外转换+审计;其他身份被拒。"""
+    """强制干预(4.4): 总控特权+审计;既定动作直接执行,兜底跳转创建审批请求。"""
     tid = ops.task_new(conn, controller, "任务", request_id="r-new")["task_id"]
     with pytest.raises(PermissionError):
         ops.task_force(conn, worker, tid, "executing", "越权尝试")
-    r = ops.task_force(conn, controller, tid, "executing", "极端情况",
+    # executing 不在既定动作集合,兜底跳转创建审批请求
+    r = ops.task_force(conn, controller, tid, "executing", "兜底请求",
                        request_id="r-force")
-    assert r["to"] == "executing"
-    aud = conn.execute(
-        "SELECT action FROM audit WHERE action='force_intervention'").fetchone()
-    assert aud is not None
+    assert r["status"] == "pending"
+    assert "approval_id" in r
