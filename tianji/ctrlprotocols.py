@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .db import injected_dir, tianji_home
+
 
 def _subprocess_flags() -> int:
     """Windows 拉起总控会话子进程的 creationflags。
@@ -182,7 +184,6 @@ class ClaudeStreamBackend(BaseBackend):
         ★ launch 产物永远用(不走 shutil.which("claude"))。
         若 launch 不含 "claude" (cmd_override 测试注入),直接起,不碰 settings。
         """
-        from .db import tianji_home
         home = Path(home) if home else (self.home or tianji_home())
         self.home = home
         shell_flag = False
@@ -194,7 +195,7 @@ class ClaudeStreamBackend(BaseBackend):
         if _override:
             cmd = list(self.launch)
         else:
-            settings = home / "settings-controller.json"
+            settings = injected_dir() / "settings-controller.json"
             if not settings.exists():
                 raise FileNotFoundError(f"{settings} 不存在,先跑 tianji start")
             exe = self.launch[0]  # 裸 "claude"; Windows 走 shell=True 由 cmd.exe 解析
@@ -626,7 +627,7 @@ def _build_provider_env(provider_env: dict, key_ref: str,
 # ===================================================================
 
 def _read_secret(home: Path, default: str = "") -> str:
-    secret_file = home / "ctrl-secret.txt"
+    secret_file = injected_dir() / "ctrl-secret.txt"
     if secret_file.exists():
         return secret_file.read_text(encoding="utf-8").strip()
     return default

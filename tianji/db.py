@@ -1,6 +1,8 @@
 """账本连接与路径: TIANJI_HOME 为根派生账本/工作目录,零配置文件(18.1)。"""
 
+import json
 import os
+import shutil
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -10,6 +12,64 @@ from .schema import render_schema, DISPATCH_STATES, MSG_TYPES
 
 def tianji_home() -> Path:
     return Path(os.environ.get("TIANJI_HOME") or Path.home() / ".tianji")
+
+
+def injected_dir() -> Path:
+    """给外部助手注入用的临时文件统一放这里。
+
+    可被 TIANJI_INJECTED_DIR env 覆盖。默认 TIANJI_HOME/injected/。
+    """
+    return Path(os.environ.get("TIANJI_INJECTED_DIR") or (tianji_home() / "injected"))
+
+
+_MIGRATE_FLAG = ".injected_migrated"
+
+
+def migrate_injected_files(conn=None) -> list:
+    """将旧位置的注入文件迁移到 injected/（幂等）。返回迁移的文件名列表。
+
+    旧位置: TIANJI_HOME/settings-controller.json, TIANJI_HOME/ctrl-secret.txt,
+            TIANJI_HOME/keys/*.key
+    新位置: TIANJI_HOME/injected/<同名>
+    搬完留标记文件，内容为迁移的文件名清单。
+    """
+    dst = injected_dir()
+    dst.mkdir(parents=True, exist_ok=True)
+    home = tianji_home()
+    flag = home / _MIGRATE_FLAG
+    if flag.exists():
+        return []
+    moved = []
+    # settings-controller.json
+    old_settings = home / "settings-controller.json"
+    if old_settings.exists() and not (dst / "settings-controller.json").exists():
+        shutil.move(str(old_settings), str(dst / "settings-controller.json"))
+        moved.append("settings-controller.json")
+    # ctrl-secret.txt
+    old_secret = home / "ctrl-secret.txt"
+    if old_secret.exists() and not (dst / "ctrl-secret.txt").exists():
+        shutil.move(str(old_secret), str(dst / "ctrl-secret.txt"))
+        moved.append("ctrl-secret.txt")
+    # keys/*.key
+    old_keys = home / "keys"
+    if old_keys.exists() and old_keys.is_dir():
+        for f in sorted(old_keys.glob("*.key")):
+            target = dst / f.name
+            if not target.exists():
+                shutil.move(str(f), str(target))
+                moved.append(f.name)
+    if moved:
+        flag.write_text("\n".join(moved), encoding="utf-8")
+        if conn is not None:
+            try:
+                conn.execute(
+                    "INSERT INTO audit (ts, action, detail) VALUES (?,?,?)",
+                    (now(), "injected_files_migrated",
+                     json.dumps({"moved": moved, "dest": str(dst)},
+                                ensure_ascii=False)))
+            except Exception:
+                pass
+    return moved
 
 
 def ledger_path() -> Path:
@@ -36,6 +96,8 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=OFF")
     _migrate(conn)
     conn.execute("PRAGMA foreign_keys=ON")
+    # 票 53: 存量注入文件迁移(settings-controller.json / ctrl-secret.txt / keys/*.key)
+    migrate_injected_files(conn)
     return conn
 
 

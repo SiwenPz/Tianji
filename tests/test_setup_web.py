@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tianji import ops, webapp, wizard
-from tianji.db import connect
+from tianji.db import connect, injected_dir
 
 
 @pytest.fixture
@@ -28,7 +28,7 @@ def home(tianji_home, monkeypatch):
 @pytest.fixture
 def client(home, monkeypatch):
     """生产路径: start 起 daemon 前已注入总控身份 env,写接口可用。"""
-    secret = (home / "ctrl-secret.txt").read_text(encoding="utf-8").strip()
+    secret = (injected_dir() / "ctrl-secret.txt").read_text(encoding="utf-8").strip()
     monkeypatch.setenv("TIANJI_WORKER_ID", "总控")
     monkeypatch.setenv("TIANJI_SECRET", secret)
     return TestClient(webapp.app)
@@ -64,9 +64,9 @@ def test_pick_controller_claude_rewrites_settings(client, home):
         "https://api.deepseek.com/anthropic")
     c.close()
     # key 本体只落文件不进账本
-    assert (home / "keys" / "主key.key").read_text() == "sk-web-1"
+    assert (injected_dir() / "主key.key").read_text() == "sk-web-1"
     # settings: 身份 env+provider env+角色话术+预授权
-    doc = json.loads((home / "settings-controller.json").read_text(
+    doc = json.loads((injected_dir() / "settings-controller.json").read_text(
         encoding="utf-8"))
     assert doc["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-web-1"
     assert doc["env"]["ANTHROPIC_BASE_URL"] == (
@@ -82,7 +82,7 @@ def test_pick_controller_builtin_login(client, home):
     r = client.post("/api/setup/controller", json={
         "shell": "claude", "source": "builtin"})
     assert r.status_code == 200, r.text
-    doc = json.loads((home / "settings-controller.json").read_text(
+    doc = json.loads((injected_dir() / "settings-controller.json").read_text(
         encoding="utf-8"))
     assert "ANTHROPIC_AUTH_TOKEN" not in doc["env"]
     c = connect()
@@ -123,7 +123,7 @@ def test_land_full_flow(client, home):
     assert r.status_code == 200, r.text
     assert r.json()["registered"] == ["审核1", "审核2", "实施1"]
     # key 落地(自动起名 key1): 文件+条目
-    assert (home / "keys" / "key1.key").read_text() == "sk-step"
+    assert (injected_dir() / "key1.key").read_text() == "sk-step"
     c = connect()
     kcfg = json.loads(c.execute("SELECT value FROM configs WHERE key='key:key1'"
                                 ).fetchone()["value"])
@@ -229,7 +229,7 @@ def test_land_registers_provider_and_credential(client, home):
     assert provider["protocol"] == "openai_chat"
     assert credential == {
         "provider": "deepseek",
-        "key_ref": str(home / "keys" / "key1.key")}
+        "key_ref": str(injected_dir() / "key1.key")}
     assert legacy["protocol"] == "openai_chat"
 
 
@@ -244,10 +244,10 @@ def test_land_rejects_protocol_and_missing_model_before_write(client, home):
         "key_value": "sk-x", "model": "m", "role": "审查"}]})
     assert bad_shell.status_code == 400
     assert "协议不兼容" in bad_shell.json()["error"]
-    assert not (home / "keys" / "key1.key").exists()
+    assert not (injected_dir() / "key1.key").exists()
 
     # 先模拟发现缓存;人工补录和探测结果都进同一清单。
-    ident = {"worker_id": "总控", "secret": (home / "ctrl-secret.txt")
+    ident = {"worker_id": "总控", "secret": (injected_dir() / "ctrl-secret.txt")
              .read_text(encoding="utf-8").strip()}
     entry = json.loads(connect().execute(
         "SELECT value FROM configs WHERE"
@@ -268,7 +268,7 @@ def test_land_rejects_protocol_and_missing_model_before_write(client, home):
 def test_land_rejects_coding_plan_cross_shell(client, home):
     client.post("/api/setup/controller", json={
         "shell": "claude", "source": "builtin"})
-    ident = {"worker_id": "总控", "secret": (home / "ctrl-secret.txt")
+    ident = {"worker_id": "总控", "secret": (injected_dir() / "ctrl-secret.txt")
              .read_text(encoding="utf-8").strip()}
     # 直接构造旧凭据语义;Web 不提供创建 CodingPlan 绑定的入口。
     ops.config_set(connect(), ident, "key:cp-key", json.dumps({
@@ -332,7 +332,7 @@ def test_claude_settings_has_explicit_ctrl_session(home):
     wz._write_controller_settings(
         home_p=home, home=str(home), shell="claude",
         secret="s")
-    doc = json.loads((home / "settings-controller.json").read_text(
+    doc = json.loads((injected_dir() / "settings-controller.json").read_text(
         encoding="utf-8"))
     assert "ctrl_session" in doc
     assert doc["ctrl_session"]["protocol"] == "stream-json"
@@ -345,7 +345,7 @@ def test_generic_settings_carries_ctrl_session_when_present(home):
     wz._write_controller_settings(
         home_p=home, home=str(home), shell="kimi",
         secret="s")
-    doc = json.loads((home / "settings-controller.json").read_text(
+    doc = json.loads((injected_dir() / "settings-controller.json").read_text(
         encoding="utf-8"))
     assert doc["ctrl_session"]["protocol"] == "acp"
     assert doc["ctrl_session"]["launch"] == ["kimi", "acp"]

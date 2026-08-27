@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from tianji import webapp
 from tianji.ctrlsession import ControllerSession
+from tianji.db import injected_dir
 
 FAKE = r"""
 import json, sys
@@ -67,7 +68,9 @@ def test_real_command_composition(tmp_path, monkeypatch):
     import json as _json
     import subprocess as _sp
     from tianji.ctrlprotocols import ClaudeStreamBackend
-    (tmp_path / "settings-controller.json").write_text(_json.dumps(
+    monkeypatch.setenv("TIANJI_HOME", str(tmp_path))
+    injected_dir().mkdir(parents=True, exist_ok=True)
+    (injected_dir() / "settings-controller.json").write_text(_json.dumps(
         {"env": {}, "appendSystemPrompt": "角色话术"}), encoding="utf-8")
     captured = {}
 
@@ -208,7 +211,9 @@ def test_model_pin_explicit(tmp_path, monkeypatch):
     实现细节不回写);无 model 不传,不破坏本地默认。"""
     import json as _json
     from tianji.ctrlprotocols import ClaudeStreamBackend
-    (tmp_path / "settings-controller.json").write_text(_json.dumps(
+    monkeypatch.setenv("TIANJI_HOME", str(tmp_path))
+    injected_dir().mkdir(parents=True, exist_ok=True)
+    (injected_dir() / "settings-controller.json").write_text(_json.dumps(
         {"env": {}, "appendSystemPrompt": ""}), encoding="utf-8")
     captured = _capture_popen(monkeypatch)
 
@@ -232,7 +237,9 @@ def test_resume_flag_composed(tmp_path, monkeypatch):
     """⑤ 有落盘 session_id → start 命令带 --resume;无盘 → 不带。"""
     import json as _json
     from tianji.ctrlprotocols import ClaudeStreamBackend, _persist_session
-    (tmp_path / "settings-controller.json").write_text(_json.dumps(
+    monkeypatch.setenv("TIANJI_HOME", str(tmp_path))
+    injected_dir().mkdir(parents=True, exist_ok=True)
+    (injected_dir() / "settings-controller.json").write_text(_json.dumps(
         {"env": {}, "appendSystemPrompt": ""}), encoding="utf-8")
     captured = _capture_popen(monkeypatch)
 
@@ -273,7 +280,9 @@ def test_resume_fail_clears_and_retries(tmp_path, monkeypatch):
     import json as _json
     import time as _t
     from tianji.ctrlprotocols import ClaudeStreamBackend, _persist_session
-    (tmp_path / "settings-controller.json").write_text(_json.dumps(
+    monkeypatch.setenv("TIANJI_HOME", str(tmp_path))
+    injected_dir().mkdir(parents=True, exist_ok=True)
+    (injected_dir() / "settings-controller.json").write_text(_json.dumps(
         {"env": {}, "appendSystemPrompt": ""}), encoding="utf-8")
     _persist_session(tmp_path, "dead-sess")
     captured = _capture_popen(monkeypatch)

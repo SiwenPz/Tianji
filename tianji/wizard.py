@@ -16,7 +16,7 @@ import shutil
 from pathlib import Path
 
 from . import auth, integrations, ops, shellrender
-from .db import now, tx
+from .db import now, tx, injected_dir
 
 def _load_shell_entry(conn, shell: str) -> dict:
     """读壳条目(集成注册表优先,shell: 兼容);缺则读内置模板兜底。"""
@@ -429,7 +429,7 @@ def _write_controller_settings(home_p: Path, home: str, shell: str, secret: str,
     if perms:
         doc["permissions"] = perms
 
-    settings = home_p / "settings-controller.json"
+    settings = injected_dir() / "settings-controller.json"
     settings.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
                         encoding="utf-8")
     return str(settings)
@@ -454,7 +454,7 @@ def land_cards(conn, home_p: Path, ident: dict, cards: list) -> dict:
                                               ensure_ascii=False), now()))
         key_name = card.get("key_name", "")
         if card.get("source") == "key" and key_name:
-            kdir = home_p / "keys"
+            kdir = injected_dir()
             kdir.mkdir(exist_ok=True)
             kfile = kdir / f"{key_name}.key"
             kfile.write_text(card["key_value"].strip(), encoding="utf-8")
@@ -538,7 +538,7 @@ def init_bootstrap(home: str = "", shell: str = "claude", model: str = "",
             ("default_project_dir", dpd, now()))
 
     # ① 总控注册+controller 身份(已注册→跳过,secret 从文件读回不轮换)
-    secret_file = home_p / "ctrl-secret.txt"
+    secret_file = injected_dir() / "ctrl-secret.txt"
     row = conn.execute(
         "SELECT is_active FROM instances WHERE name='总控'").fetchone()
     if row and row["is_active"]:
@@ -567,7 +567,7 @@ def init_bootstrap(home: str = "", shell: str = "claude", model: str = "",
     # ② key/provider(可选,给了才写;key 本体只落 home/keys 文件不进账本)
     provider_configured = bool(key_value and base_url)
     if key_value:
-        kdir = home_p / "keys"
+        kdir = injected_dir()
         kdir.mkdir(exist_ok=True)
         kfile = kdir / f"{key_name}.key"
         kfile.write_text(key_value.strip(), encoding="utf-8")
