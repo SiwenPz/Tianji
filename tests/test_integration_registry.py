@@ -1,4 +1,4 @@
-﻿import json
+import json
 import pytest
 from tianji import integrations, ops, wizard
 from tianji.integrations import (
@@ -220,6 +220,46 @@ def test_discover_models_key_from_credential_ref(
                         credential="主key")
     assert r["ok"] is True
     assert seen["headers"]["Authorization"] == "Bearer sk-from-file"
+
+
+def test_discover_models_captures_context_window(conn, controller,
+                                                 monkeypatch):
+    """票48(13.1): 探测可得→上下文窗口字段进缓存;探测不到→标'待实测'。
+
+    假象消除证明: 之前模型条目只有 {"id":...},14.2/9.2 拿不到窗口,
+    现在 discover 响应里的 context_window/context_length 会被带出。
+    """
+    ensure_builtin_registry(conn, controller, request_id="builtin")
+
+    def fake_http(url, headers, timeout=10):
+        return {"data": [{"id": "big", "context_window": 128000},
+                         {"id": "ctxlen", "context_length": "64000"},
+                         {"id": "plain"}]}
+
+    monkeypatch.setattr(integrations, "_http_json", fake_http)
+    r = discover_models(conn, controller, provider="kimi",
+                        key_value="sk-live-1")
+    assert r["ok"] is True
+    assert r["models"] == ["big", "ctxlen", "plain"]  # 对外仍返回纯 id 清单
+    entry = _config(conn, "integration_provider:kimi")
+    by = {m["id"]: m for m in entry["models"]}
+    assert by["big"]["context_window"] == 128000
+    assert "context_window_status" not in by["big"]  # 探测到=实测值,无待实测标
+    assert by["ctxlen"]["context_window"] == 64000  # 字符串数字也认
+    assert by["plain"]["context_window"] is None
+    assert by["plain"]["context_window_status"] == "待实测"
+
+
+def test_manual_model_add_entry_has_window_field(conn, controller):
+    """票48(13.1): 人工补录模型同样带 context_window 字段(无探测值→待实测)。"""
+    ensure_builtin_registry(conn, controller, request_id="builtin")
+    add_provider_model(conn, controller, "kimi", "kimi-manual-1",
+                       request_id="ma-1")
+    entry = _config(conn, "integration_provider:kimi")
+    manual = [m for m in entry["models"] if m["id"] == "kimi-manual-1"][0]
+    assert manual["pending_test"] is True
+    assert manual["context_window"] is None
+    assert manual["context_window_status"] == "待实测"
 
 
 def test_manual_model_add_marks_pending_test(conn, controller):

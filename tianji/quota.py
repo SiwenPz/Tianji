@@ -55,6 +55,8 @@ def scan_transcript_usage(conn, instance: str, transcript_path: str) -> dict:
 
     claude 转录格式: message.usage.{input_tokens,output_tokens,...};
     其它壳有 usage 字段即累加,没有跳过(读不了的壳=静态预估,14.2)。
+    账本里的 usage=该转录文件的当前累计总量;尺寸守卫: 巡检每拍都路过,
+    文件没长过就回报存量、不整读重扫;文件变了→全量重算(幂等,不翻倍)。
     """
     data = _load(conn, instance)
     usage = data.get("usage") or {"input_tokens": 0, "output_tokens": 0,
@@ -62,6 +64,10 @@ def scan_transcript_usage(conn, instance: str, transcript_path: str) -> dict:
     p = Path(transcript_path)
     if not p.is_file():
         return {"instance": instance, "skipped": "转录不存在"}
+    size = p.stat().st_size
+    if data.get("usage_last_size") == size:
+        return {"instance": instance, "usage": usage, "unchanged": True}
+    usage = {"input_tokens": 0, "output_tokens": 0, "lines": 0}
     for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
         if '"usage"' not in line:
             continue
@@ -76,41 +82,108 @@ def scan_transcript_usage(conn, instance: str, transcript_path: str) -> dict:
         usage["output_tokens"] += int(u.get("output_tokens") or 0)
         usage["lines"] += 1
     data["usage"] = usage
+    data["usage_last_size"] = size
     _save(conn, instance, data)
     return {"instance": instance, "usage": usage}
 
 
-def read_ccswitch(conn, db_path: str, instance: str) -> dict:
-    """cc-switch 账目表读取+错误码归类(14.1③;未装 cc-switch 的环境跳过)。"""
-    if not os.path.isfile(db_path):
-        return {"skipped": "无 cc-switch 库(该层不适用)"}
-    db = sqlite3.connect(db_path)
-    db.row_factory = sqlite3.Row
-    try:
-        rows = db.execute(
-            "SELECT status_code, COUNT(*) AS n FROM proxy_request_logs"
-            " GROUP BY status_code").fetchall()
-    except sqlite3.Error:
-        db.close()
-        return {"skipped": "cc-switch 库无 proxy_request_logs 表"}
-    db.close()
+def _ccswitch_proxy_summary(db) -> dict:
+    """proxy_request_logs: 错误码归类表(429=限流≠故障)。"""
+    rows = db.execute(
+        "SELECT status_code, COUNT(*) AS n FROM proxy_request_logs"
+        " GROUP BY status_code").fetchall()
     summary = {}
     for r in rows:
         code = r["status_code"]
         cls = ERROR_CLASSES.get(code, "故障" if code >= 500 else "其他")
         summary[code] = {"class": cls, "count": r["n"]}
+    return summary
+
+
+def _ccswitch_extra_table(db, table: str) -> dict:
+    """cc-switch 附加账目表 best-effort 摘要(usage_daily_rollups/provider_health)。
+
+    版本差异容忍: 表不存在/列对不上都降级成只报在场情况,不抛错。
+    """
+    row = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table,)).fetchone()
+    if row is None:
+        return {"table": table, "present": False}
+    out = {"table": table, "present": True}
+    try:
+        out["rows"] = db.execute(
+            f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+    except sqlite3.Error:
+        out["rows"] = -1
+        return out
+    try:
+        cols = [c[1] for c in db.execute(f"PRAGMA table_info({table})")]
+    except sqlite3.Error:
+        return out
+    token_cols = ("input_tokens", "output_tokens", "total_tokens",
+                  "prompt_tokens", "completion_tokens")
+    status_cols = ("status", "state", "result", "healthy")
+    for c in cols:
+        cl = c.lower()
+        if cl in token_cols:
+            try:
+                out[cl] = db.execute(
+                    f"SELECT COALESCE(SUM({c}), 0) AS s FROM {table}"
+                ).fetchone()["s"]
+            except sqlite3.Error:
+                pass
+        elif cl in status_cols:
+            try:
+                out[f"{c}_by"] = {
+                    r["k"]: r["n"] for r in db.execute(
+                        f"SELECT {c} AS k, COUNT(*) AS n FROM {table}"
+                        f" GROUP BY {c}").fetchall()}
+            except sqlite3.Error:
+                pass
+    return out
+
+
+def read_ccswitch(conn, db_path: str, instance: str) -> dict:
+    """cc-switch 账目表读取+错误码归类(14.1③;未装 cc-switch 的环境跳过)。
+
+    429=限流(额度已尽,置 exhausted,12 暂停派新活消费);403=权限/封禁
+    (归类写档案,不算额度用尽);另补读 usage_daily_rollups/provider_health
+    两张账目表(版本差异容忍,缺表就如实报 absent)。
+    """
+    if not os.path.isfile(db_path):
+        return {"skipped": "无 cc-switch 库(该层不适用)"}
+    db = sqlite3.connect(db_path)
+    db.row_factory = sqlite3.Row
+    try:
+        summary = _ccswitch_proxy_summary(db)
+    except sqlite3.Error:
+        db.close()
+        return {"skipped": "cc-switch 库无 proxy_request_logs 表"}
+    rollups = _ccswitch_extra_table(db, "usage_daily_rollups")
+    health = _ccswitch_extra_table(db, "provider_health")
+    db.close()
     data = _load(conn, instance)
+    if summary:
+        data["last_error"] = ""
+        data["exhausted"] = False
     if 429 in summary:
         # 429=限流≠故障: 实例档案归类+额度已尽标记(12 的暂停派新活消费此信号)
         data["last_error"] = "rate_limit"
         data["exhausted"] = True
         ops.update_profile_notes(conn, instance, "429=限流(额度已尽),非故障")
-    elif summary:
-        data["last_error"] = ""
-        data["exhausted"] = False
-    data["ccswitch"] = summary
+    if 403 in summary:
+        # 403=权限/封禁: 归类写实例档案,但不是额度用尽,不置 exhausted
+        data["last_error"] = "forbidden"
+        ops.update_profile_notes(conn, instance, "403=权限/封禁,按账号问题归类(非限流)")
+    data["ccswitch"] = {
+        "proxy_request_logs": summary,
+        "usage_daily_rollups": rollups,
+        "provider_health": health,
+    }
     _save(conn, instance, data)
-    return {"instance": instance, "summary": summary}
+    return {"instance": instance, "summary": summary,
+            "usage_daily_rollups": rollups, "provider_health": health}
 
 
 def context_health(conn, instance: str) -> dict:
@@ -155,19 +228,77 @@ def allocator_health_check(conn, task_id: int, expected_size: int,
     return {"qualified": qualified, "skipped": skipped, "hints": hints}
 
 
+def _shell_quota_sources(conn, shell: str) -> list:
+    """读壳条目能力声明里的额度信号层(integration_shell: → shell: → 内置模板兜底)。"""
+    for key in (f"integration_shell:{shell}", f"shell:{shell}"):
+        row = conn.execute(
+            "SELECT value FROM configs WHERE key=?", (key,)).fetchone()
+        if row:
+            try:
+                caps = (json.loads(row["value"]) or {}).get("capabilities") or {}
+            except json.JSONDecodeError:
+                caps = {}
+            srcs = caps.get("quota_sources")
+            if srcs:
+                return list(srcs)
+    try:
+        from .adapters import template as tpl_mod
+        tpl = tpl_mod.get_template(shell)
+        return list((tpl.capabilities or {}).get("quota_sources") or [])
+    except KeyError:
+        return []
+
+
+def _scan_instance_transcript(conn, instance: str, shell: str,
+                              isolated_dir: str = "") -> dict | None:
+    """按该实例最近登记会话定位转录文件,顺带累加 usage(14.1② 巡检接线)。"""
+    reg = conn.execute(
+        "SELECT session_id FROM instance_registrations"
+        " WHERE instance_name=? ORDER BY id DESC LIMIT 1",
+        (instance,)).fetchone()
+    if reg is None or not reg["session_id"]:
+        return None
+    try:
+        from .adapters import transcript_parser
+        p = transcript_parser.transcript_path(
+            shell, reg["session_id"], isolated_dir=isolated_dir)
+    except Exception:
+        return None
+    if p is None:
+        return None
+    return scan_transcript_usage(conn, instance, str(p))
+
+
 def monitor_scan(conn):
-    """监控器巡检复查(14.1 零新增常驻/14.2 第二检查点): 将尽提示+已尽必知。"""
+    """监控器巡检复查(14.1 零新增常驻/14.2 第二检查点): 将尽提示+已尽必知。
+
+    接线(票 48): 按壳声明的额度信号层顺带跑——
+    ②转录 usage 累加(声明 transcript 的壳);③cc-switch 账目(配了库路径
+    且壳声明 ccswitch 的实例)。单个实例失败只跳过该实例,不拖垮整轮巡检。
+    """
     full_pct = float(ops._config(conn, "quota_full_pct") or 98)
+    ccswitch_db = (ops._config(conn, "ccswitch_db_path") or "").strip()
     for inst in conn.execute(
-            "SELECT name FROM instances WHERE is_active=1").fetchall():
-        data = _load(conn, inst["name"])
+            "SELECT name, shell, isolated_dir FROM instances"
+            " WHERE is_active=1").fetchall():
+        name = inst["name"]
+        try:
+            sources = _shell_quota_sources(conn, inst["shell"])
+            if "transcript" in sources:
+                _scan_instance_transcript(conn, name, inst["shell"],
+                                          inst["isolated_dir"])
+            if ccswitch_db and "ccswitch" in sources:
+                read_ccswitch(conn, ccswitch_db, name)
+        except Exception:
+            continue  # 单个实例的额度巡检失败不拖垮整轮
+        data = _load(conn, name)
         pct = float(data.get("context_pct") or 0)
         if data.get("exhausted"):
             continue  # 已尽已归类,不重复升级
         if pct >= full_pct:
             messages.send(
                 conn, "escalation", "monitor",
-                {"worker_id": inst["name"],
+                {"worker_id": name,
                  "reason": f"上下文占用 {pct:.0f}% 将尽(14.1 已尽必知,"
                            f"将尽有提示);建议续接或换实例"},
                 "controller")

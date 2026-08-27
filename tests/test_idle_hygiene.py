@@ -94,6 +94,40 @@ def test_resume_uses_same_mechanism(conn, controller, worker):
     assert "续接滚动" in a["detail"]
 
 
+def test_cleanup_summary_includes_tail_taskbook_artifacts(
+        conn, controller, worker, tmp_path, monkeypatch):
+    """票48(14.4): 换活打扫摘要=转录尾部 N 行+任务书+产物清单,N 存账本配置可改。"""
+    tid_a, did_a = _settle_task(conn, controller, worker, "任务A", "s")
+    work = Path(task_dir(did_a))
+    (work / "task.md").write_text("# 任务A\n要求XYZ", encoding="utf-8")
+    (work / "extra.md").write_text("副产物", encoding="utf-8")
+    sid = "hyg-sess-1"
+    tr = tmp_path / ".codex" / "sessions" / "x" / f"rollout-{sid}.jsonl"
+    tr.parent.mkdir(parents=True)
+    tr.write_text("\n".join(
+        json.dumps({"usage": {"input_tokens": i}}) for i in range(1, 26)),
+        encoding="utf-8")
+    monkeypatch.setattr("tianji.adapters.transcript_parser.Path.home",
+                        lambda: tmp_path)
+    conn.execute(
+        "INSERT INTO instance_registrations"
+        " (instance_name, dispatch_id, status, dcap_hash, session_id, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (worker["worker_id"], did_a, "active", "h", sid, now()))
+    ops.config_set(conn, controller, "cleanup_tail_lines", "3",
+                   request_id="hyg-tail")
+    r = hygiene.cleanup(conn, worker["worker_id"], 99999, reason="换活打扫")
+    assert r["cleaned"] is True
+    a = conn.execute("SELECT detail FROM audit WHERE action='hygiene_clean'"
+                     " ORDER BY id DESC LIMIT 1").fetchone()
+    s = json.loads(a["detail"])["summary"]
+    assert s["taskbook"].startswith("# 任务A")
+    assert s["artifacts"] == ["extra.md", "report.md", "task.md"]
+    tail = s["transcript_tail"].splitlines()
+    assert len(tail) == 3  # 配置 N=3: 只留尾部 3 行
+    assert tail[-1] == json.dumps({"usage": {"input_tokens": 25}})
+
+
 def test_retire_keeps_resources(conn, controller):
     """验收 6: 回收(unbind)需总控动作;回收后画像/表现分保留,可复活重启。"""
     ops.instance_register(conn, "老工", "codex", "step-router-v1",

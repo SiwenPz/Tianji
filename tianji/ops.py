@@ -284,6 +284,10 @@ DEFAULTS = {
     "allocator_review_bonus": "10",   # 总控评估满分加成(参与软排序,相对 0-100 评估分折算)
     "health_pct_threshold": "85",     # 上下文健康度提示阈值%(14.2,实现期参数)
     "quota_full_pct": "98",           # 上下文将尽提示阈值%(14.1 已尽必知将尽有提示)
+    # 票 48: cc-switch 账本库路径(14.1③,空=未装 cc-switch 该层跳过);
+    # 换活打扫摘要的转录尾部行数(14.4,可改)
+    "ccswitch_db_path": "",
+    "cleanup_tail_lines": "20",
     "idle_bonus_threshold": "3600",   # 空闲超阈值秒数(14.3 软排序加分门槛)
     "idle_bonus": "5",                # 空闲超阈值加分(方案 A: 防饿死防单点)
     # 组合红黑榜(9.5,票 25): 出厂注册的视图类插件(票 23 接口,可关)
@@ -363,6 +367,55 @@ def _validate_instance_combo(conn, shell: str, key_name: str, model: str) -> tup
                 f"CodingPlan 跨壳: key:{key_name} 已被壳"
                 f" {existing['shell']} 占用,不能用于壳 {shell}")
     return True, ""
+
+
+def _model_context_window(conn, key_name: str, model: str) -> int | None:
+    """13.1 读取侧: 从凭据→供应商条目或旧 key 条目读该模型的探测上下文窗口。
+
+    探测得到(discover 缓存里带数值)就返回,探测不到返回 None(标"待实测"的
+    模型=没拿到数,如实未知)。
+    """
+    if not key_name or not model:
+        return None
+    # 集成注册表: credential:{key_name} → integration_provider:{p} → models
+    row = conn.execute(
+        "SELECT value FROM configs WHERE key=?",
+        (f"credential:{key_name}",)).fetchone()
+    if row:
+        try:
+            cred = json.loads(row["value"])
+        except json.JSONDecodeError:
+            cred = {}
+        pname = cred.get("provider") or ""
+        if pname:
+            prow = conn.execute(
+                "SELECT value FROM configs WHERE key=?",
+                (f"integration_provider:{pname}",)).fetchone()
+            if prow:
+                try:
+                    pentry = json.loads(prow["value"])
+                except json.JSONDecodeError:
+                    pentry = {}
+                for m in pentry.get("models", []):
+                    if isinstance(m, dict) and m.get("id") == model:
+                        cw = m.get("context_window")
+                        if isinstance(cw, int) and cw > 0:
+                            return cw
+    # 旧 key 条目(key: 直接带 models 清单)
+    krow = conn.execute(
+        "SELECT value FROM configs WHERE key=?",
+        (f"key:{key_name}",)).fetchone()
+    if krow:
+        try:
+            kcfg = json.loads(krow["value"])
+        except json.JSONDecodeError:
+            kcfg = {}
+        for m in kcfg.get("models", []):
+            if isinstance(m, dict) and m.get("id") == model:
+                cw = m.get("context_window")
+                if isinstance(cw, int) and cw > 0:
+                    return cw
+    return None
 
 
 def audit(conn: sqlite3.Connection, action: str, detail: dict):
@@ -1494,6 +1547,13 @@ def instance_register(conn, name, shell, model, isolated_dir="", launch_cmd="",
                     raise PermissionError(
                         "instance register --controller 仅总控身份可执行"
                         "(防越权覆盖总控绑定)")
+        # 13.1 读取侧(票 48): 没显式给上下文窗口时,从 key 条目/供应商
+        # 条目的模型探测缓存自动带出,供 14.2 健康度与 9.2 硬过滤读取;
+        # 探测不到(待实测)就保持 0=如实未知,不瞎填。
+        if not context_window and key_name:
+            cw = _model_context_window(c, key_name, model)
+            if cw:
+                context_window = cw
         if row is not None:
             # 换绑复活: 更新四元组+能力画像,is_active 置 1
             c.execute(
