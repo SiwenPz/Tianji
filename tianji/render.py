@@ -13,7 +13,7 @@ from pathlib import Path
 from . import auth, messages
 from .db import now, task_dir, tx
 
-TASKBOOK_TEMPLATE = """# 任务书 dispatch #{dispatch_id}(task #{task_id}): {title}
+TASKBOOK_TEMPLATE_ZH = """# 任务书 dispatch #{dispatch_id}(task #{task_id}): {title}
 
 ## 任务描述
 
@@ -49,6 +49,50 @@ expect_min = {expect_min} 分钟(进度阶梯 = expect_min × 2;超时由监控�
 能自己查证的不许问;"超出能力/反复试错不收敛/须动改动边界声明之外的文件"才该求助。求助方向总控,经 worker_help 账本消息沟通;要思路→总控写 worker_help_reply 答复;要换人→总控裁决走既有驳回重派/强制干预通道。
 """
 
+TASKBOOK_TEMPLATE_EN = """# Dispatch #{dispatch_id}(task #{task_id}): {title}
+
+## Description
+
+{description}
+{rework_section}{review_section}
+## Verification Command(written by architect, do not modify)
+
+```
+{verify_cmd}
+```
+
+## Scope Statement(11.2,required; overshoot=mechanical_fail rejected; request expansion via worker_help first)
+
+{scope_section}
+
+## Report Path
+
+{report_path}
+
+## Expected Duration
+
+expect_min = {expect_min} minutes(progress ladder = expect_min × 2; timeout escalated by monitor, manual resolution)
+
+## Reporting Discipline(mechanical, do not skip)
+
+1. When done, write the result report to the report path;
+2. Background task list: worker_done report must list all background sub-agents/async tasks with their respective results(unfinished items must note the reason);
+3. Settlement(sole authoritative completion signal): {settle_cmd};
+4. Clear context after settlement(/clear or restart session; 5.3 cleanup mechanism, settlement form already includes cleanup requirements).
+
+## Help Discipline(5.6,mechanical injection)
+
+Do not ask what you can verify yourself; only seek help when "beyond capability/repeated trial-and-error doesn't converge/need to modify files outside scope statement". Direct help requests to the controller via worker_help ledger messages; need guidance→controller writes worker_help_reply reply; need reassignment→controller decides via existing reject-reassign/force-intervention channels.
+"""
+
+_TASKBOOK_TEMPLATES = {
+    "zh": TASKBOOK_TEMPLATE_ZH,
+    "en": TASKBOOK_TEMPLATE_EN,
+}
+
+# Default to Chinese if language not found
+_DEFAULT_TEMPLATE_LANG = "zh"
+
 # 应然清单基本形态(11.5): claude 壳条目(期望 env 集+任务书模板+登记行字段+钩子清单)
 SHOULD_LIST_CLAUDE = {
     "shell": "claude",
@@ -69,11 +113,15 @@ def _review_section(conn, dispatch: dict) -> str:
     2026-08 演示踩坑: 通用任务书不含被审对象,审核者在自己目录找产物误 reject。
     票 04 扩展: 按 axis 分支渲染审核指令(spec/quality)。
     """
+    lang = _resolve_language(conn)
     row = conn.execute(
         "SELECT id, worker_id, task_dir FROM dispatches WHERE task_id=?"
         " AND worker_role='worker' AND status='done' ORDER BY id DESC LIMIT 1",
         (dispatch["task_id"],)).fetchone()
     if row is None:
+        if lang == "en":
+            return ("\n## Artifact Under Review\n\n(No settled worker dispatch found for this task, "
+                    "nothing to review. Please escalate to the controller, do not guess artifact location)\n")
         return ("\n## 被审对象\n\n(未找到本任务已结算的实施者派单,"
                 "无可审对象,请升级总控,不要自行猜测产物位置)\n")
     tdir = Path(row["task_dir"])
@@ -86,21 +134,38 @@ def _review_section(conn, dispatch: dict) -> str:
     ).fetchone()
     template = json.loads(template_row["value"]) if template_row else {}
     axis_guide = template.get(axis, "逐条核对任务书验收标准;审核报告须附行为证据。")
-    lines = [
-        "",
-        "## 被审对象(你是审核者: 审查以下实施者产出,不要自己动手干活)",
-        "",
-        f"- 被审派单: dispatch #{row['id']}(实施者 {row['worker_id']})",
-        f"- 产物目录: {row['task_dir']}",
-        f"- 实施者报告: {tdir / 'report.md'}",
-        f"- 产物清单: {', '.join(artifacts) if artifacts else '(空)'}",
-        "",
-        f"### 审核轴: {axis}",
-        axis_guide,
-        "",
-        '逐条核对"任务描述"与"验收命令";审核报告写入你的报告路径。',
-        "",
-    ]
+    if lang == "en":
+        lines = [
+            "",
+            "## Artifact Under Review(You are the reviewer: examine the following worker's output, do not do the work yourself)",
+            "",
+            f"- Reviewed dispatch: dispatch #{row['id']}(worker {row['worker_id']})",
+            f"- Artifact directory: {row['task_dir']}",
+            f"- Worker report: {tdir / 'report.md'}",
+            f"- Artifact list: {', '.join(artifacts) if artifacts else '(empty)'}",
+            "",
+            f"### Review Axis: {axis}",
+            axis_guide,
+            "",
+            'Check the "Description" and "Verification Command" against the task; write the review report to your report path.',
+            "",
+        ]
+    else:
+        lines = [
+            "",
+            "## 被审对象(你是审核者: 审查以下实施者产出,不要自己动手干活)",
+            "",
+            f"- 被审派单: dispatch #{row['id']}(实施者 {row['worker_id']})",
+            f"- 产物目录: {row['task_dir']}",
+            f"- 实施者报告: {tdir / 'report.md'}",
+            f"- 产物清单: {', '.join(artifacts) if artifacts else '(空)'}",
+            "",
+            f"### 审核轴: {axis}",
+            axis_guide,
+            "",
+            '逐条核对"任务描述"与"验收命令";审核报告写入你的报告路径。',
+            "",
+        ]
     # 非 git 降级标注(8.3/8.4 维度 2,票 21): 机械边界比对不可用→人工核对项
     trow = conn.execute(
         "SELECT scope_guard, project_dir FROM tasks WHERE id=?",
@@ -114,26 +179,38 @@ def _review_section(conn, dispatch: dict) -> str:
         is_git = bool(wt and os.path.isdir(wt)) or bool(
             trow["project_dir"] and _is_git_repo(trow["project_dir"]))
         if not is_git:
-            lines += [
-                "- **非 git 项目降级项(8.4 维度 2)**: 机械边界比对不可用,"
-                "请人工核对产物实际改动路径是否都在改动边界声明内: "
-                + ", ".join(f"`{p}`" for p in json.loads(raw_scope)),
-                "",
-            ]
+            if lang == "en":
+                lines += [
+                    "- **Non-git project downgrade(8.4 dimension 2)**: Mechanical boundary comparison unavailable, "
+                    "please manually verify that the actual modified paths are within the scope statement: "
+                    + ", ".join(f"`{p}`" for p in json.loads(raw_scope)),
+                    "",
+                ]
+            else:
+                lines += [
+                    "- **非 git 项目降级项(8.4 维度 2)**: 机械边界比对不可用,"
+                    "请人工核对产物实际改动路径是否都在改动边界声明内: "
+                    + ", ".join(f"`{p}`" for p in json.loads(raw_scope)),
+                    "",
+                ]
     return "\n".join(lines)
 
 
-def _rework_section(dispatch: dict) -> str:
+def _rework_section(conn, dispatch: dict) -> str:
     """重派任务书须带驳回原因与返修要点(4.3): 否则工人不知前一轮差在哪。
 
     reason 来自派单载荷(驳回/重派时写入);首次派单 reason 为空则不渲染。
     """
+    lang = _resolve_language(conn)
     try:
         reason = json.loads(dispatch["payload"] or "{}").get("reason", "")
     except json.JSONDecodeError:
         reason = ""
     if not reason:
         return ""
+    if lang == "en":
+        return ("\n## Previous Rejection/Rework Reason(4.3, read before starting)\n\n"
+                f"{reason}\n")
     return ("\n## 上一轮驳回/重派原因(4.3,先读懂再动手)\n\n"
             f"{reason}\n")
 
@@ -265,7 +342,26 @@ def _apply_thinking_level(conn, inst, payload: dict) -> dict:
     return {"applied": True, "target": target, "level": level_zh}
 
 
+def _resolve_language(conn) -> str:
+    """从账本 configs 读取用户语言配置,默认中文。"""
+    row = conn.execute(
+        "SELECT value FROM configs WHERE key='user_language'"
+    ).fetchone()
+    return row["value"] if row else "zh"
+
+
+def _lang_fallback_tag(lang: str) -> str:
+    """缺翻译语言回退中文并标注。"""
+    if lang not in _TASKBOOK_TEMPLATES:
+        return f"\n\n> **语言回退**: 语言 '{lang}' 缺少翻译,本段回退中文。\n"
+    return ""
+
+
 def _render_taskbook(conn, dispatch: dict, task: dict, report_path: str) -> str:
+    lang = _resolve_language(conn)
+    template = _TASKBOOK_TEMPLATES.get(lang,
+                                       _TASKBOOK_TEMPLATES[_DEFAULT_TEMPLATE_LANG])
+    fallback_tag = _lang_fallback_tag(lang)
     if dispatch["worker_role"] == "reviewer":
         settle_cmd = (f'`tianji dispatch settle {dispatch["id"]} "{report_path}"'
                       f" pass`(通过)或 `... reject`(拒绝,报告附原因)")
@@ -274,22 +370,22 @@ def _render_taskbook(conn, dispatch: dict, task: dict, report_path: str) -> str:
         settle_cmd = f'`tianji dispatch settle {dispatch["id"]} "{report_path}" ok`'
         review_section = ""
     description = task["description"] or "(无描述)"
-    raw_scope = task["scope_guard"] if "scope_guard" in task.keys() else ""
+    raw_scope = task["scope_guard"] if "scope_guard" in task and task["scope_guard"] else ""
     prefixes = json.loads(raw_scope) if raw_scope else []
     if prefixes:
         scope_section = ("只允许改动以下目录前缀内的文件(新增文件限同处):\n"
                          + "\n".join(f"- `{p}`" for p in prefixes))
     else:
         scope_section = "(未声明——架构师在计划确认前必写,11.2)"
-    return TASKBOOK_TEMPLATE.format(
+    return template.format(
         dispatch_id=dispatch["id"], task_id=task["id"], title=task["title"],
         description=description,
         verify_cmd=task["verify_cmd"] or "(未配置)",
         scope_section=scope_section,
         report_path=report_path, expect_min=dispatch["expect_min"],
         settle_cmd=settle_cmd, review_section=review_section,
-        rework_section=_rework_section(dispatch),
-    )
+        rework_section=_rework_section(conn, dispatch),
+    ) + fallback_tag
 
 
 def spawn(conn: sqlite3.Connection, instance_name: str, dispatch_id: int,
@@ -314,7 +410,8 @@ def spawn(conn: sqlite3.Connection, instance_name: str, dispatch_id: int,
         t = c.execute("SELECT * FROM tasks WHERE id=?", (d["task_id"],)).fetchone()
         # 应然核查(11.5 基本形态): 任务书可渲染+登记行字段齐
         report_path = str(Path(d["task_dir"]) / "report.md")
-        taskbook = _render_taskbook(c, d, t, report_path)
+        from .db import row_to_dict
+        taskbook = _render_taskbook(c, d, row_to_dict(t), report_path)
         tdir = Path(d["task_dir"])
         tdir.mkdir(parents=True, exist_ok=True)
         (tdir / "task.md").write_text(taskbook, encoding="utf-8")
