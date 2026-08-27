@@ -295,6 +295,8 @@ def _oa2an_req(body: dict, tags: list) -> None:
     _normalize_tc_oa2an(body)
     if "stop" in body:
         body["stop_sequences"] = body.pop("stop")
+    if "max_tokens" not in body:
+        body["max_tokens"] = 4096
     for k in ["top_k", "tools_config", "metadata", "thinking",
                "prompt_caching", "service_tier"]:
         if k in body:

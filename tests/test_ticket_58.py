@@ -984,3 +984,15 @@ class TestEdgeCases:
         assert out["messages"][0] == {"role": "tool",
                                       "tool_call_id": "t1",
                                       "content": "plain string"}
+
+    def test_oa2an_default_max_tokens(self):
+        body = {"model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}]}
+        out, _ = convert.convert_request(body, "openai_chat", "anthropic")
+        assert out["max_tokens"] == 4096
+
+    def test_oa2an_preserve_max_tokens(self):
+        body = {"model": "gpt-4o", "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}]}
+        out, _ = convert.convert_request(body, "openai_chat", "anthropic")
+        assert out["max_tokens"] == 100
