@@ -339,12 +339,15 @@ def add_provider_model(conn, ident, provider, model_id, request_id=None):
 def require_resolvable_credential(conn, key_name, base_url="", protocol="",
                                   key_ref=""):
     """装配前置校验(13.8): 凭据路径缺注册表条目且已给数据不足以显式
-    登记时报错指路;免 key 实例(key_name 空)不要求凭据条目。
+    登记时报错指路;免 key 实例(key_name 空)不要求凭据条目;池名直接放行(票59)。
 
     返回解析结果 {"provider","protocol","key_ref"};不通过抛 ValueError。
     """
     if not key_name:
         return None  # 免 key 路径(如壳内置 OAuth): 无凭据可登记
+    # 池名放行(票59):池名不是凭据,不由本函数解析
+    if _is_pool_name(conn, key_name):
+        return None
     if _config(conn, f"credential:{key_name}") is not None:
         return None  # 已显式登记,直接放行
     row = conn.execute("SELECT value FROM configs WHERE key=?",
@@ -403,7 +406,7 @@ def ensure_instance_entries(conn, ident, shell, shell_entry=None,
             _write_entry(c, ident, skey, value, request_id)
             bridged.append(skey)
         cred = _config(c, f"credential:{key_name}") if key_name else None
-        if cred is None and key_name:
+        if cred is None and key_name and not _is_pool_name(c, key_name):
             resolved = require_resolvable_credential(
                 c, key_name, base_url=base_url, protocol=protocol,
                 key_ref=key_ref)
@@ -509,6 +512,81 @@ def derive_provider_name(base_url: str) -> str:
     return f"custom-{host or 'local'}-{digest}"
 
 
+_ANTH_OAI_PAIRS = {frozenset(["anthropic", "openai_chat"])}
+
+def _proto_compatible(a: str, b: str) -> bool:
+    """Check if two protocols are compatible (exact match or convertible)."""
+    if a == b:
+        return True
+    if frozenset([a, b]) in _ANTH_OAI_PAIRS:
+        return True
+    return False
+
+
+def _is_pool_name(conn, key_name: str) -> bool:
+    """Detect if key_name refers to a pool (not a credential)."""
+    if not key_name:
+        return False
+    row = conn.execute(
+        "SELECT key FROM configs WHERE key=?",
+        (f"pool:{key_name}",),
+    ).fetchone()
+    return row is not None
+
+
+def _cfg_get(conn, key: str, default: str = "") -> str:
+    """Read a scalar config string value."""
+    row = conn.execute("SELECT value FROM configs WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def _pool_proxy_url(conn) -> str:
+    """Get proxy base_url from daemon config."""
+    port = _cfg_get(conn, "daemon.proxy_port", "").strip()
+    if not port:
+        return ""
+    return f"http://127.0.0.1:{port}"
+
+
+def _pool_member_models_protocols(conn, pool_name: str):
+    """Resolve pool members to (models_set, protocols_set).
+
+    Returns (set_of_model_ids, set_of_protocol_strings).
+    Empty pool → (set(), set()).
+    """
+    from . import pool as pool_mod
+
+    pool_data = pool_mod._read_pool(conn, pool_name)
+    if pool_data is None:
+        return None, None
+
+    members = pool_data.get("members", [])
+    if not members:
+        return set(), set()
+
+    models: set = set()
+    protos: set = set()
+
+    for cred_name in members:
+        cred = _config(conn, f"credential:{cred_name}")
+        if cred is None:
+            continue
+        pname = (cred.get("provider") or "").strip()
+        if not pname:
+            continue
+        pentry = _config(conn, f"integration_provider:{pname}")
+        if pentry is None:
+            continue
+        for m in pentry.get("models", []):
+            if isinstance(m, dict) and m.get("id"):
+                models.add(m["id"])
+        proto = pentry.get("protocol", "")
+        if proto:
+            protos.add(normalize_legacy_protocol(proto))
+
+    return models, protos
+
+
 def _legacy_key_cfg(conn, key_name: str) -> dict:
     if not key_name:
         return {}
@@ -518,25 +596,94 @@ def _legacy_key_cfg(conn, key_name: str) -> dict:
     return json.loads(row["value"]) if row else {}
 
 
+# POOL_VALIDATORS = {}  # kept for backward compat if referenced
+
+
+def _pool_list_conn(conn) -> list:
+    """List pools using given conn (for use by other modules without circular import)."""
+    from . import pool as pool_mod
+    return pool_mod.pool_list(conn)
+
+
 def validate_worker_card(conn, shell: str, model: str, provider="",
                          base_url="", protocol="", key_name="",
                          shell_protocols=None) -> dict:
-    """Web 提交前的注册表机械校验(13.4/13.8)。
+    """Web 提交前的注册表机械校验(13.4/13.8/票59)。
 
     校验不写账本;自定义 URL 允许在通过后由调用方显式登记。
     返回解析出的 provider / protocol,供登记与落地复用。
+
+    key_name 可为池名:此时模型清单=池成员模型并集(按壳协议过滤),
+    协议兼容性=池内存在同协议成员或经转换可达成员。
     """
     shell_cfg = _config(conn, f"integration_shell:{shell}")
     if shell_cfg is None:
         row = conn.execute(
-            "SELECT value FROM configs WHERE key=?", (f"shell:{shell}",)
-        ).fetchone()
+            "SELECT value FROM configs WHERE key=?",
+            (f"shell:{shell}",)).fetchone()
         shell_cfg = json.loads(row["value"]) if row else None
     if shell_cfg is None and shell_protocols is not None:
         shell_cfg = {"protocols": shell_protocols}
     if shell_cfg is None:
         raise ValueError(f"助手壳 {shell} 没有壳条目,不能配置实例")
 
+    raw_shell_protocols = shell_cfg.get("protocols", [])
+    shell_protos = {normalize_legacy_protocol(p) for p in raw_shell_protocols}
+
+    # ---- 池名分支(票59) ------------------------------------------
+    pool_name = None
+    if key_name and _is_pool_name(conn, key_name):
+        pool_name = key_name
+        pool_models, pool_protos = _pool_member_models_protocols(
+            conn, pool_name)
+
+        if pool_models is None:
+            raise ValueError(f"池 {pool_name} 不存在")
+
+        if not pool_models:
+            raise ValueError(
+                f"池 {pool_name} 无成员或成员无可列模型,无法验证")
+
+        if model not in pool_models:
+            raise ValueError(
+                f"模型 {model} 不在池 {pool_name} 成员模型里"
+                f"(池成员模型: {sorted(pool_models)})")
+
+        if not pool_protos:
+            raise ValueError(
+                f"池 {pool_name} 成员无已知协议,无法确认协议兼容性")
+
+        # 协议兼容性:池内存在同协议成员或经转换可达成员
+        compatible_shell_proto = None
+        for sp in sorted(shell_protos):
+            if sp in pool_protos:
+                compatible_shell_proto = sp
+                break
+        if compatible_shell_proto is None:
+            for sp in sorted(shell_protos):
+                for pp in pool_protos:
+                    if _proto_compatible(pp, sp):
+                        compatible_shell_proto = sp
+                        break
+                if compatible_shell_proto:
+                    break
+
+        if compatible_shell_proto is None:
+            raise ValueError(
+                f"池 {pool_name} 无与壳 {shell} 协议兼容的成员"
+                f"(壳支持: {sorted(shell_protos)},"
+                f" 池成员协议: {sorted(pool_protos)})")
+
+        base_url = _pool_proxy_url(conn)
+        if not base_url:
+            raise ValueError(
+                f"daemon 未记录 proxy 端口,无法确定池 {pool_name} 的访问地址"
+                "(请先运行 tianji daemon start)")
+
+        return {"provider": pool_name, "protocol": compatible_shell_proto,
+                "base_url": base_url, "coding_plan": False}
+
+    # ---- 非池分支(原逻辑) ----------------------------------------
     pentry = None
     pname = (provider or "").strip()
     base_url = (base_url or "").strip()
@@ -581,11 +728,9 @@ def validate_worker_card(conn, shell: str, model: str, provider="",
             f" 供应商需要 {p_proto}")
 
     legacy_cfg = _legacy_key_cfg(conn, key_name)
-    coding_plan = (pentry or {}).get("coding_plan", False) if pentry \
-        else False
+    coding_plan = (pentry or {}).get("coding_plan", False) if pentry         else False
     coding_plan = coding_plan or bool(legacy_cfg.get("coding_plan"))
-    bound_shell = (pentry or {}).get("coding_plan_shell", "") \
-        if pentry else ""
+    bound_shell = (pentry or {}).get("coding_plan_shell", "")         if pentry else ""
     legacy_ref = str(legacy_cfg.get("key_ref") or "")
     match = re.fullmatch(r"shell:([^/]+)", legacy_ref)
     if match:

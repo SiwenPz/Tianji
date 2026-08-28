@@ -26,7 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from tianji import ctrlprotocols
 from tianji.ctrlprotocols import BaseBackend, get_backend_class
-from . import cockpit, ctrlsession, integrations, ops, permission, wizard
+from . import cockpit, ctrlsession, integrations, ops, permission, pool as pool_mod, wizard
 from .db import connect, injected_dir, tianji_home
 
 app = FastAPI(title="天机驾驶舱", docs_url=None, redoc_url=None)
@@ -299,12 +299,157 @@ async def api_entry_delete(req: Request):
         conn.close()
 
 
-@app.get("/api/integrations")
-def api_integrations():
-    """集成注册表快照与旧条目迁移状态(13.8/票42;只读,不含密钥本体)。"""
+# ---- 号池 API (票55/59) -------------------------------------------
+
+@app.get("/api/pool/list")
+async def api_pool_list(req: Request):
+    """列出全部池(只读,含成员摘要)。"""
     conn = connect()
     try:
-        return integrations.registry_state(conn)
+        pools = pool_mod.pool_list(conn)
+        return {"pools": pools}
+    finally:
+        conn.close()
+
+
+@app.get("/api/pool/detail")
+async def api_pool_detail(req: Request):
+    """池详情(含成员 credential 详情)。"""
+    name = (req.query_params.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"error": "name 必填"}, status_code=400)
+    conn = connect()
+    try:
+        detail = pool_mod.pool_status(conn, name)
+        members = []
+        for m_name in detail.get("members", []):
+            cred = integrations._config(conn, f"credential:{m_name}")
+            if cred:
+                prov_name = cred.get("provider", "")
+                prov = integrations._config(conn, f"integration_provider:{prov_name}") or {}
+                members.append({
+                    "name": m_name,
+                    "provider": prov_name,
+                    "base_url": cred.get("base_url", prov.get("base_url", "")),
+                    "protocol": cred.get("protocol", ""),
+                    "models": cred.get("models", prov.get("models", [])),
+                    "note": cred.get("note", ""),
+                })
+            else:
+                members.append({"name": m_name, "not_found": True})
+        detail["members_detail"] = members
+        return detail
+    finally:
+        conn.close()
+
+
+@app.post("/api/pool/create")
+async def api_pool_create(req: Request):
+    """建池(总控身份;幂等)。"""
+    body = await req.json()
+    name = (body.get("name") or "").strip()
+    members = body.get("members") or []
+    if not name or ":" in name:
+        return JSONResponse({"error": "池名须非空且不含冒号"}, status_code=400)
+    ident = _require_controller(connect())
+    if ident is None:
+        return JSONResponse({"error": "未注入总控身份,页面只读"}, status_code=403)
+    conn = connect()
+    try:
+        rid = body.get("request_id") or f"web-pool-create-{ops.now()}"
+        result = pool_mod.pool_create(conn, ident, name, members=members, request_id=rid)
+        return result
+    finally:
+        conn.close()
+
+
+@app.post("/api/pool/add-member")
+async def api_pool_add_member(req: Request):
+    """归 key 入池(总控身份;幂等)。"""
+    body = await req.json()
+    pool_name = (body.get("pool") or "").strip()
+    credential = (body.get("credential") or "").strip()
+    if not pool_name or not credential:
+        return JSONResponse({"error": "pool 和 credential 必填"}, status_code=400)
+    ident = _require_controller(connect())
+    if ident is None:
+        return JSONResponse({"error": "未注入总控身份,页面只读"}, status_code=403)
+    conn = connect()
+    try:
+        rid = body.get("request_id") or f"web-pool-add-{ops.now()}"
+        result = pool_mod.pool_add_member(conn, ident, pool_name, credential, request_id=rid)
+        return result
+    finally:
+        conn.close()
+
+
+@app.post("/api/pool/remove-member")
+async def api_pool_remove_member(req: Request):
+    """摘除成员(总控身份;幂等)。"""
+    body = await req.json()
+    pool_name = (body.get("pool") or "").strip()
+    credential = (body.get("credential") or "").strip()
+    if not pool_name or not credential:
+        return JSONResponse({"error": "pool 和 credential 必填"}, status_code=400)
+    ident = _require_controller(connect())
+    if ident is None:
+        return JSONResponse({"error": "未注入总控身份,页面只读"}, status_code=403)
+    conn = connect()
+    try:
+        rid = body.get("request_id") or f"web-pool-rm-{ops.now()}"
+        result = pool_mod.pool_remove_member(conn, ident, pool_name, credential, request_id=rid)
+        return result
+    finally:
+        conn.close()
+
+
+@app.post("/api/pool/rotate-token")
+async def api_pool_rotate_token(req: Request):
+    """令牌轮换(总控身份;幂等)。token 明文仅此一次返回。"""
+    body = await req.json()
+    pool_name = (body.get("name") or "").strip()
+    if not pool_name:
+        return JSONResponse({"error": "name 必填"}, status_code=400)
+    ident = _require_controller(connect())
+    if ident is None:
+        return JSONResponse({"error": "未注入总控身份,页面只读"}, status_code=403)
+    conn = connect()
+    try:
+        rid = body.get("request_id") or f"web-pool-rotate-{ops.now()}"
+        result = pool_mod.pool_rotate_token(conn, ident, pool_name, request_id=rid)
+        return result
+    finally:
+        conn.close()
+
+
+@app.delete("/api/pool")
+async def api_pool_delete(req: Request):
+    """删池(总控身份;幂等)。"""
+    body = await req.json()
+    pool_name = (body.get("name") or "").strip()
+    if not pool_name:
+        return JSONResponse({"error": "name 必填"}, status_code=400)
+    ident = _require_controller(connect())
+    if ident is None:
+        return JSONResponse({"error": "未注入总控身份,页面只读"}, status_code=403)
+    conn = connect()
+    try:
+        rid = body.get("request_id") or f"web-pool-del-{ops.now()}"
+        result = pool_mod.pool_delete(conn, ident, pool_name, request_id=rid)
+        return result
+    finally:
+        conn.close()
+
+
+@app.get("/api/integrations")
+def api_integrations():
+    """集成注册表快照与旧条目迁移状态(13.8/票42;票59:含池数据;只读,不含密钥本体)。"""
+    conn = connect()
+    try:
+        state = integrations.registry_state(conn)
+        pools = pool_mod.pool_list(conn)
+        state["pools"] = pools
+        return state
     finally:
         conn.close()
 
@@ -510,6 +655,7 @@ def _setup_state(conn) -> dict:
         "keys": keys,
         "default_project_dir": dpd["value"] if dpd else "",
         "configured": bool(ctrl and ctrl["shell"] != "未配置" and insts),
+        "pools": pool_mod.pool_list(conn),
     }
 
 
@@ -771,6 +917,15 @@ async def api_setup_land(req: Request):
                     skip_test=True, confirm=True, role_note=role,
                     request_id=f"web-land-{name}")
                 registered.append(r["name"])
+            # 票59: 落地后归池
+            pool_name = (card.get("pool") or "").strip()
+            if pool_name and r.get("key_name"):
+                try:
+                    pool_mod.pool_add_member(conn, ident, pool_name,
+                        r["key_name"],
+                        request_id=f"web-land-pool-{name}")
+                except (KeyError, ValueError):
+                    pass  # Non-fatal: pool assignment failed, instance still created
         return {**res, "registered": registered, "state": _setup_state(conn)}
     finally:
         conn.close()
@@ -967,6 +1122,83 @@ function togglePeek(name){
  peekOf=name;peekDetail=null;
  if(lastState)render(lastState);
  refreshDetail(name)}
+/* ===== 号池管理(票59): 建池/归 key 入池/摘除/令牌/详情 ===== */
+let poolData={pools:[]};
+async function renderPools(){
+ const box=document.getElementById("pool-list");
+ const status=document.getElementById("pool-status");
+ if(!box||!status)return;
+ status.textContent="读取中…";
+ try{
+  const r=await j("/api/pool/list");
+  poolData=r;
+  if(!r.pools||!r.pools.length){
+   status.textContent="暂无号池(总控入阵后可建池)";
+   box.innerHTML=`<div class="peek-row"><span>空</span><span>点击上方"建池"创建</span></div>`;
+   return}
+  status.textContent=`${r.pools.length} 个池`;
+  let h="";
+  for(const p of r.pools){
+   const members=p.members||[];
+   const hasToken=p.has_token;
+   h+=`<div class="peek-row" style="flex-direction:column;gap:4px">
+    <div style="display:flex;justify-content:space-between;gap:6px">
+     <b>${esc(p.name)}</b>
+     <span class="sysline">${members.length} 成员 · ${hasToken?"有 token":"无 token"}</span>
+    </div>
+    <div class="sysline" style="font-size:11px">成员: ${members.length?members.map(m=>esc(m)).join(", "):"(空)"}</div>
+    <div class="row" style="gap:4px;margin-top:2px">
+     <select class="pool-add-sel" data-pool="${esc(p.name)}" style="flex:1">
+      <option value="">归入 credential …</option>
+      ${r.available_credentials||[]}.filter(c=>!members.includes(c)).map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join("")}
+     </select>
+     <button class="btn-ghost" onclick="addPoolMember('${esc(p.name)}')">加入</button>
+     ${members.map(m=>`<button class="btn-ghost" style="padding:3px 8px;font-size:11px" onclick="removePoolMember('${esc(p.name)}','${esc(m)}')">-${esc(m)}</button>`).join("")}
+    </div>
+    ${hasToken?`<div class="row" style="gap:4px;margin-top:2px">
+      <button class="btn-ghost" onclick="rotatePoolToken('${esc(p.name)}')">轮换 token</button>
+      <button class="btn-no" onclick="deletePool('${esc(p.name)}')">删池</button>
+     </div>`:`<div class="row" style="gap:4px;margin-top:2px">
+      <button class="btn-no" onclick="deletePool('${esc(p.name)}')">删池</button>
+     </div>`}
+   </div>`}
+  box.innerHTML=h;
+ }catch(e){status.textContent="池读取失败"}}
+async function createPool(){
+ if(cockpitReadonly){alert("只读: 未注入总控身份");return}
+ const name=gv("new-pool-name");
+ if(!name){alert("池名不能为空");return}
+ const r=await j("/api/pool/create",{method:"POST",headers:CT,body:JSON.stringify({name,members:[],request_id:"web-pool-create-"+Date.now()})});
+ if(r.error){alert(r.error);return}
+ if(r.token){alert("token 明文请保存: "+r.token)}
+ renderPools()}
+async function addPoolMember(pool){
+ if(cockpitReadonly){alert("只读: 未注入总控身份");return}
+ const sel=document.querySelector(`.pool-add-sel[data-pool="${pool}"]`);
+ const cred=sel?sel.value:"";
+ if(!cred){alert("选一个 credential");return}
+ const r=await j("/api/pool/add-member",{method:"POST",headers:CT,body:JSON.stringify({pool,credential:cred,request_id:"web-pool-add-"+Date.now()})});
+ if(r.error){alert(r.error);return}
+ renderPools()}
+async function removePoolMember(pool,cred){
+ if(cockpitReadonly){alert("只读: 未注入总控身份");return}
+ if(!confirm(`确认把 ${cred} 从池 ${pool} 摘除?`))return;
+ const r=await j("/api/pool/remove-member",{method:"POST",headers:CT,body:JSON.stringify({pool,credential:cred,request_id:"web-pool-rm-"+Date.now()})});
+ if(r.error){alert(r.error);return}
+ if(r.warning)alert(r.warning);
+ renderPools()}
+async function rotatePoolToken(pool){
+ if(cockpitReadonly){alert("只读: 未注入总控身份");return}
+ if(!confirm(`确认轮换池 ${pool} 的 token? 旧 token 将作废。`))return;
+ const r=await j("/api/pool/rotate-token",{method:"POST",headers:CT,body:JSON.stringify({name:pool,request_id:"web-pool-rotate-"+Date.now()})});
+ if(r.error){alert(r.error);return}
+ alert("新 token 请保存: "+r.token)}
+async function deletePool(pool){
+ if(cockpitReadonly){alert("只读: 未注入总控身份");return}
+ if(!confirm(`确认删除池 ${pool}? 此操作不可逆。`))return;
+ const r=await j("/api/pool",{method:"DELETE",headers:CT,body:JSON.stringify({name:pool,request_id:"web-pool-del-"+Date.now()})});
+ if(r.error){alert(r.error);return}
+ renderPools()}
 function closePeek(){peekOf=null;peekDetail=null;if(lastState)render(lastState)}
 async function refreshDetail(name){
  try{const d=await j("/api/instance/"+encodeURIComponent(name));
@@ -1063,22 +1295,34 @@ function orgHtml(){
  return `<div class="peek-head"><b>角色编排与条目</b><span style="flex:1"></span>
  <button class="btn-ghost" onclick="closePeek()">收起 ×</button></div>
  <div class="peek-rows" id="org-rows">${orgRowsHtml()}</div>
+ <h4>号池管理</h4>
+ <div class="peek-rows" id="pool-section">
+  <div class="sysline" id="pool-status" style="padding:4px 0">读取中…</div>
+  <div id="pool-list"></div>
+  <div class="row" style="gap:6px;margin-top:8px">
+   <input id="new-pool-name" placeholder="新池名" style="width:120px">
+   <button class="btn-ghost" onclick="createPool()">建池</button>
+   <button class="btn-ghost" onclick="renderPools()">刷新</button>
+  </div>
+ </div>
  <h4>集成注册表(四分区·含旧条目迁移)</h4>
  <div class="peek-rows" id="registry"><div class="sysline" id="registry-status" style="padding:4px 0">读取中…</div>
  <div id="registry-list"></div>
  <div class="peek-acts" style="padding:12px 0"><button class="btn-ghost" id="registry-migrate" onclick="migrateRegistry()">初始化/迁移</button></div></div>`}
 async function renderRegistry(){
- const box=document.getElementById("registry-list");
- const status=document.getElementById("registry-status");
+ const regBox=document.getElementById("registry-list");
+ const regStatus=document.getElementById("registry-status");
  const btn=document.getElementById("registry-migrate");
- if(!box||!status||!btn)return;
+ if(!regBox||!regStatus||!btn)return;
  btn.disabled=cockpitReadonly;
  btn.textContent=cockpitReadonly?"只读":"初始化/迁移";
+ // 渲染池分区(票59)
+ renderPools();
  try{
   const reg=await j("/api/integrations");
   const entries=reg.entries||[],migrations=reg.migrations||[];
   const pending=migrations.filter(x=>!x.migrated).length;
-  status.textContent=pending
+  regStatus.textContent=pending
    ?`旧条目迁移: ${migrations.length-pending}/${migrations.length} 已迁移,${pending} 待处理`
    :`旧条目迁移: ${migrations.length} 条已就绪`;
   const groups={
@@ -1104,8 +1348,8 @@ async function renderRegistry(){
     h+=`<div class="peek-row"><span>${esc(name)}</span><span>${esc(config)}${migrated?" · "+migrated:""}</span></div>`}
    if(!group.items.length)h+=`<div class="peek-row"><span>空</span><span>-</span></div>`;
    h+="</div>"}
-  box.innerHTML=h;
- }catch(e){status.textContent="注册表读取失败"}}
+  regBox.innerHTML=h;
+ }catch(e){regStatus.textContent="注册表读取失败"}}
 async function migrateRegistry(){
  if(cockpitReadonly)return;
  const btn=document.getElementById("registry-migrate");
@@ -1442,7 +1686,13 @@ async function setProjectDir(){
  el("pd-msg").textContent="已保存";S=r.state;render()}
 (async function(){
  S=await j("/api/setup/state");
- fillShells();fillProviders();srcToggle("c");srcToggle("w");kimiHintToggle();render()})();
+ fillShells();fillProviders();fillPools();srcToggle("c");srcToggle("w");kimiHintToggle();render()})();
+async function assignPool(name,pool){
+ if(!pool)return;
+ if(cockpitReadonly){alert("只读: 未注入总控身份");return}
+ const r=await j("/api/pool/add-member",{method:"POST",headers:CT,body:JSON.stringify({pool,credential:name,request_id:"web-assign-"+Date.now()})});
+ if(r.error){alert(r.error);return}
+ alert("已归池 "+pool+": "+name)}
 function kimiHintToggle(){
  const ctrl=S.controller;const kimiHint=el("kimi-login-hint");
  if(kimiHint&&ctrl)kimiHint.style.display=(ctrl.shell=="kimi"&&ctrl.source!="key")?"":"none";

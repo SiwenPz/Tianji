@@ -655,6 +655,11 @@ def wizard_add(name: str, shell: str, model: str, key_name: str = "",
                skip_test: bool = False, confirm: bool = False,
                request_id: str = typer.Option(None, "--request-id")):
     """向导新增实例(四步走);--confirm 才确认生成注册,否则只呈现。"""
+    # 票59:直绑 key 输出"不推荐"提示
+    if key_name and not integrations._is_pool_name(_conn(), key_name):
+        typer.echo(
+            typer.style(f"⚠ 直绑 key 已不推荐:建议通过池分配(池提供故障转移与负载均衡)",
+                        fg=typer.colors.YELLOW))
     _out(wizard.add_instance(_conn(), _ident(), name, shell, model,
                              key_name=key_name, base_url=base_url,
                              protocol=protocol, key_ref=key_ref,

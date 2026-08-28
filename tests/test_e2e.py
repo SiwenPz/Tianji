@@ -9,6 +9,8 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from tianji.shellrender import render
+
 from tianji.cli import app
 
 runner = CliRunner()
@@ -159,3 +161,57 @@ def conn_rows(home, sql):
     rows = conn.execute(sql).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def test_pool_wizard_integration(tianji_home):
+    """票59 号池闭环: 建池→入成员→实例 pool 绑定→渲染含池凭证。"""
+    from tianji.db import connect
+    conn = connect()
+    try:
+        from tianji import ops, integrations, wizard, pool as pool_mod
+        import secrets
+        secret = secrets.token_hex(16)
+        ops.ensure_defaults(conn)
+        # 注册总控
+        rc = ops.instance_register(
+            conn, "总控", "claude", "deepseek-v4-flash", controller=True)
+        secret = rc["secret"]
+        ident = {"worker_id": "总控", "secret": secret}
+        # 确保内置 provider 已注册
+        integrations.ensure_builtin_registry(conn, ident,
+                                             request_id="e2e-registry")
+        # 1. 登记凭据
+        cred_ref = str(tianji_home / "key1.txt")
+        Path(cred_ref).write_text("test-key-for-pool", encoding="utf-8")
+        integrations.register_credential(conn, ident, "cred1", "stepfun", key_ref=cred_ref,
+                                         request_id="e2e-cred-add")
+        # 2. 建池(含成员)
+        r = pool_mod.pool_create(conn, ident, "test-pool",
+                                  members=["cred1"],
+                                  request_id="e2e-pool-create")
+        assert r["name"] == "test-pool"
+        assert len(r["members"]) == 1
+        assert "token" in r and len(r["token"]) == 64
+        # 3. 用 pool 名作 key_name 新增实例
+        iso = tianji_home / "instances" / "审核1-claude"
+        inst = wizard.add_instance(conn, ident, "审核1", "claude",
+                                    "deepseek-v4-flash", key_name="test-pool",
+                                    isolated_dir=str(iso),
+                                    skip_test=True, confirm=True,
+                                    request_id="e2e-pool-inst")
+        assert inst["name"] == "审核1"
+        assert inst["registered"] is True
+        # pool_note 确认 pool 名已处理
+        # 4. 通过 shellrender 渲染启动命令(含池 token)
+        cmd = render(conn, "claude", instance="审核1", model="deepseek-v4-flash",
+                     key_name="test-pool", isolated_dir=str(iso))
+        assert isinstance(cmd, tuple)
+        launch_cmd, arts = cmd
+        assert "settings" in launch_cmd  # claude 走 settings 文件
+        assert len(arts) >= 1  # settings.json 落盘
+        # 5. 搜 pool list 确认 member 数不变
+        pools = pool_mod.pool_list(conn)
+        pool_names = {p["name"] for p in pools}
+        assert "test-pool" in pool_names
+    finally:
+        conn.close()

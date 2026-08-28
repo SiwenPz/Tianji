@@ -324,10 +324,13 @@ def ensure_defaults(conn: sqlite3.Connection):
 def _validate_instance_combo(conn, shell: str, key_name: str, model: str) -> tuple:
     """实例组合合法性机械校验(13.4 三条全过才允许)。
 
-    空 key_name 跳过校验(向后兼容,演示数据不含 key)。
+    空 key_name 跳过校验(向后兼容,演示数据不含 key)；池名者也跳过(key 条目不是池的概念)。
     返回 (ok: bool, reason: str)。
     """
     if not key_name:
+        return True, ""
+    # 票59: 池名不经过 key: 条目校验,走壳条目+池模型映射校验(已在后期执行)
+    if integrations._is_pool_name(conn, key_name):
         return True, ""
     # 1. 壳条目存在性
     shell_row = conn.execute(
