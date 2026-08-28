@@ -23,8 +23,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
-from . import integrations, ops
-from .db import connect, now
+from .. import integrations, ops
+from ..db import connect, now
+from .convert import is_conversion_needed
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,7 @@ _DEFAULT_CB_HALF_OPEN_NEED = 3
 _DEFAULT_MAX_RETRIES = 5
 
 
+# ---------------------------------------------------------------------------
 # 账本读写
 # ---------------------------------------------------------------------------
 _LOG_PREFIX = "[tianji-proxy]"
@@ -271,6 +273,12 @@ class PoolRouter:
         self._rr[pool_name] = (idx + 1) % len(matched)
         return choice
 
+    def all_breakers_open(self) -> bool:
+        """检查所有断路器是否都处于 open 状态。"""
+        if not self._breakers:
+            return False
+        return all(not cb.allow() for cb in self._breakers.values())
+
     def record(self, pool_name, member_name, success):
         cb = self._breakers.get(member_name)
         if cb is None:
@@ -280,6 +288,123 @@ class PoolRouter:
         else:
             cb.record_failure()
         self._persist_breakers(pool_name)
+
+        # pool_member_health 留痕
+        _update_member_health(self._conn, pool_name, member_name, success)
+
+
+# ---------------------------------------------------------------------------
+# pool_member_health 辅助
+# ---------------------------------------------------------------------------
+def _update_member_health(conn, pool_name, member_name, success):
+    """更新成员健康快照。"""
+    ts = now()
+    row = conn.execute(
+        "SELECT * FROM pool_member_health WHERE pool_name=? AND member_name=?",
+        (pool_name, member_name)).fetchone()
+    if row:
+        if success:
+            conn.execute(
+                "UPDATE pool_member_health SET consecutive_failures=0,"
+                " last_success_at=?, last_error=''"
+                " WHERE pool_name=? AND member_name=?",
+                (ts, pool_name, member_name))
+        else:
+            conn.execute(
+                "UPDATE pool_member_health SET consecutive_failures=consecutive_failures+1,"
+                " last_failure_at=?, last_error=? WHERE pool_name=? AND member_name=?",
+                (ts, "upstream_error", pool_name, member_name))
+    else:
+        if success:
+            conn.execute(
+                "INSERT INTO pool_member_health"
+                " (pool_name, member_name, consecutive_failures,"
+                " last_success_at, last_failure_at, last_error)"
+                " VALUES (?,?,0,?,0,'')",
+                (pool_name, member_name, ts))
+        else:
+            conn.execute(
+                "INSERT INTO pool_member_health"
+                " (pool_name, member_name, consecutive_failures,"
+                " last_success_at, last_failure_at, last_error)"
+                " VALUES (?,?,1,0,?,?)",
+                (pool_name, member_name, ts, "upstream_error"))
+
+
+# ---------------------------------------------------------------------------
+# pool_request_logs 日志
+# ---------------------------------------------------------------------------
+def _log_request(conn, pool_name, member_name, req_model, model, status_code,
+                 elapsed_ms, first_token_ms, input_tokens, output_tokens,
+                 is_stream, is_converted, session_id, request_id):
+    ts = now()
+    conn.execute(
+        "INSERT OR IGNORE INTO pool_request_logs"
+        " (request_id, pool_name, member_name, request_model, model,"
+        " status_code, elapsed_ms, first_token_ms, input_tokens, output_tokens,"
+        " is_stream, is_converted, session_id, ts)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (request_id, pool_name, member_name, req_model or "", model or "",
+         status_code, elapsed_ms or 0, first_token_ms or 0,
+         input_tokens or 0, output_tokens or 0,
+         1 if is_stream else 0, 1 if is_converted else 0,
+         session_id or "", ts))
+
+
+# ---------------------------------------------------------------------------
+# pool_daily_rollups 日聚合
+# ---------------------------------------------------------------------------
+def update_daily_rollup(conn, pool_name, member_name, model, status_code,
+                        input_tokens, output_tokens):
+    """追加/更新日聚合(UPSERT,重放安全)。"""
+    from datetime import datetime, timezone
+    rollup_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    model = model or ""
+    row = conn.execute(
+        "SELECT * FROM pool_daily_rollups"
+        " WHERE rollup_date=? AND pool_name=? AND member_name=? AND model=?",
+        (rollup_date, pool_name, member_name, model)).fetchone()
+    if row:
+        conn.execute(
+            "UPDATE pool_daily_rollups SET"
+            " request_count=request_count+1,"
+            " success_count=success_count+?,"
+            " input_tokens=input_tokens+?,"
+            " output_tokens=output_tokens+?"
+            " WHERE rollup_date=? AND pool_name=? AND member_name=? AND model=?",
+            (1 if 200 <= status_code < 300 else 0,
+             input_tokens or 0, output_tokens or 0,
+             rollup_date, pool_name, member_name, model))
+    else:
+        conn.execute(
+            "INSERT INTO pool_daily_rollups"
+            " (rollup_date, pool_name, member_name, model,"
+            " request_count, success_count, errors, input_tokens, output_tokens)"
+            " VALUES (?,?,?,?, 1,?,?,?,?)",
+            (rollup_date, pool_name, member_name, model,
+             1 if 200 <= status_code < 300 else 0,
+             0 if 200 <= status_code < 300 else 1,
+             input_tokens or 0, output_tokens or 0))
+
+
+# ---------------------------------------------------------------------------
+# pool 耗尽信号(池=key 等价物)
+# ---------------------------------------------------------------------------
+def _set_pool_exhausted(conn, pool_name):
+    """标记池耗尽：将 pool_name 写入 quota 表(pool=key 等价物)。"""
+    import json
+    qkey = "quota:" + pool_name
+    data = json.dumps({"exhausted": True, "ts": now(),
+                       "source": "proxy_pool", "reason": "all_members_failed"},
+                      ensure_ascii=False)
+    conn.execute(
+        "INSERT OR REPLACE INTO configs (key, value, updated_at) VALUES (?,?,?)",
+        (qkey, data, now()))
+
+
+def _clear_pool_exhausted(conn, pool_name):
+    """池恢复 → 清除耗尽标记。"""
+    conn.execute("DELETE FROM configs WHERE key=?", ("quota:" + pool_name,))
 
 
 # ---------------------------------------------------------------------------
@@ -443,9 +568,22 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             max_retries = int(_cfg(conn, "pool_proxy.max_retries",
                                    _DEFAULT_MAX_RETRIES))
 
+            t0 = time.monotonic()
+            first_token_ms = 0
+            elapsed_ms = 0
+
             # 重试循环(上限默认 5 次,进账本可配;流中断不重试由 _ForwardError 控制)
             last_err_detail = ""
             last_stream_broken = False
+            last_status = 0
+            last_input_tokens = 0
+            last_output_tokens = 0
+            last_is_stream = False
+            any_member_used = False
+            request_id = self.headers.get("X-Request-ID", "")
+            session_id = self.headers.get("X-Session-ID", "")
+            used_members = []
+            used_models = {}
 
             for attempt in range(max_retries + 1):
                 member_name, cred, prov = self.router.pick(
@@ -457,7 +595,19 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                             503, "no_available_member",
                             "pool={} model={} proto={}".format(
                                 pool_name, req_model, req_proto))
-                    return
+                        last_status = 503
+                    break
+
+                any_member_used = True
+                t_try_start = time.monotonic()
+
+                # 记转换信息
+                resp_proto = prov.get("protocol", "openai_chat")
+                normalized_req = integrations.normalize_legacy_protocol(req_proto)
+                normalized_resp = integrations.normalize_legacy_protocol(
+                    resp_proto)
+                is_converted = is_conversion_needed(
+                    normalized_req, normalized_resp)
 
                 # 读明文 key(key_ref 文件)
                 key_ref = cred.get("key_ref", "")
@@ -479,21 +629,57 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     status, resp_hdrs, resp_body = _forward_http(
                         method, target_url, fwd_headers, body,
                         tt, tf, ts)
-                    # 成功: 记录 + 持久化
+
+                    # Token 统计(尝试从响应提取)
+                    try:
+                        rj = json.loads(resp_body)
+                        usage = rj.get("usage") or {}
+                        last_input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+                        last_output_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+                        last_is_stream = False
+                    except Exception:
+                        pass
+
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    last_status = status
+                    # 记录成功 + 持久化
                     self.router.record(pool_name, member_name, True)
+                    used_members.append(member_name)
+                    used_models[member_name] = prov.get("protocol", "")
                     self._send_resp(status, resp_hdrs, resp_body)
-                    return
+                    break
                 except _ForwardError as exc:
+                    elapsed_ms = (time.monotonic() - t_try_start) * 1000
                     self.router.record(pool_name, member_name, False)
+                    used_members.append(member_name)
+                    used_models[member_name] = prov.get("protocol", "")
                     last_err_detail = exc.detail or ""
                     last_stream_broken = exc.stream_broken
                     if exc.stream_broken:
+                        last_status = 502
                         break  # 流中断不重试
 
-            # 重试耗尽
-            code = "stream_interrupted" if last_stream_broken else "all_members_failed"
-            self._send_json(502, code,
-                            "retries_exhausted: " + last_err_detail)
+            # 重试耗尽后仍未成功 → 发送 502 + 池耗尽信号
+            if last_status == 0:
+                _set_pool_exhausted(conn, pool_name)
+                self._send_json(502, "retryable",
+                                last_err_detail or "all_retries_exhausted")
+
+            # 日志(每成员落一行)
+            for mem in used_members:
+                proto = used_models.get(mem, "")
+                _log_request(
+                    conn, pool_name, mem, req_model, req_model,
+                    last_status, elapsed_ms, first_token_ms,
+                    last_input_tokens, last_output_tokens,
+                    last_is_stream, is_converted, session_id, request_id)
+                update_daily_rollup(
+                    conn, pool_name, mem, req_model, last_status,
+                    last_input_tokens, last_output_tokens)
+
+            if last_status == 503 and not any_member_used:
+                # 全成员熔断: 池耗尽信号(池=key 等价物)
+                _set_pool_exhausted(conn, pool_name)
         finally:
             conn.close()
 

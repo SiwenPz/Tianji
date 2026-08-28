@@ -127,7 +127,7 @@ def api_state():
     conn = connect()
     try:
         snap = cockpit.snapshot(conn)
-        cards = [c for cl in snap.values() if isinstance(cl, list)
+        cards = [c for k, cl in snap.items() if k != "pools" and isinstance(cl, list)
                  for c in cl if isinstance(c, dict)]
         ctrl = conn.execute(
             "SELECT shell FROM instances WHERE name='总控'").fetchone()
@@ -980,8 +980,25 @@ function renderPeek(){
   if(pk.dataset.mode!=="org"){pk.innerHTML=orgHtml();pk.dataset.mode="org"}
   return}
  pk.dataset.mode="inst";
- pk.innerHTML=instHtml(peekOf)}
-/* 实例详情(审计缺口 1,真详情面板替掉 alert): 快照卡取现状,/api/instance 取派单明细 */
+ pk.innerHTML=instHtml(peekOf);
+ const pp=document.getElementById("peek-pool");
+ if(pp && lastState){
+  const pools=lastState.snapshot&&lastState.snapshot.pools;
+  if(pools&&pools.length){
+   let h="<h4 style='margin:10px 0 4px;color:#7e93bd'>号池健康</h4>";
+   for(const pl of pools){
+    const dop=pl.circuit_open_count>0?"style='color:#ff6b6b'":"";
+    h+=`<div class='peek-row' ${dop}><b>${esc(pl.name)}</b>`
+     +`成员${pl.member_count} 熔断${pl.circuit_open_count}</div>`;
+    for(const m of pl.members){
+     const dotC=m.circuit==="open"?"color:#ff6b6b":(m.circuit==="half_open"?"color:#ffb454":"color:#7e93bd");
+     const failN=m.consecutive_failures?` FAIL×${m.consecutive_failures} `:"";
+     h+=`<div class='peek-row'><span style='${dotC};margin-right:6px'>●</span>`
+      +`<span style='flex:1'>${esc(m.name)} ${failN}${esc(m.last_error||"")}</span></div>`;
+    }
+   }
+   pp.innerHTML=h;
+  }}
 function instHtml(name){
  const c=snapCards[name]||{instance_name:name};
  const shell=shellOf(name);
@@ -1001,9 +1018,10 @@ function instHtml(name){
  <div class="sysline">${esc(shell)} + ${esc(c.model||"")}${role?" · "+esc(role):""}</div></div>
  <span style="flex:1"></span><button class="btn-ghost" onclick="closePeek()">收起 ×</button></div>
  <div class="peek-rows">${rows.map(([k,v])=>`<div class="peek-row"><span>${k}</span><span>${esc(v)}</span></div>`).join("")}</div>
+<div id="peek-pool"></div>
  <div class="peek-acts">
  <button class="btn-ghost" ${did?"":"disabled"} onclick="nudge(${did||0})">续推 nudge</button>
- <button class="btn-no" ${(tid||did)?"":"disabled"} onclick="force(${tid||"null"},${did||"null"})">强制干预…</button></div>`}
+ <button class="btn-no" ${(tid||did)?"":"disabled"} onclick="force(${tid||"null"},${did||"null"})">强制干预…</button></div>`
 /* 续推 nudge: 无专用接口(零新增接口),走 /api/ctrl/send 请总控续推(花钱动作归总控 14.5) */
 async function nudge(did){
  if(cockpitReadonly){alert("只读: 未注入总控身份");return}

@@ -187,7 +187,11 @@ def read_ccswitch(conn, db_path: str, instance: str) -> dict:
 
 
 def context_health(conn, instance: str) -> dict:
-    """上下文健康度(14.2): pct/剩余窗口/提示。读不了转录的壳=静态预估调用方兜。"""
+    """上下文健康度(14.2): pct/剩余窗口/提示。读不了转录的壳=静态预估调用方兜。
+
+    同时检查池级耗尽信号(池=key 等价物): 若存在 quota: 键(非实例名)且
+    exhausted=true → 该实例视为耗尽,allocator_health_check 会跳过。
+    """
     data = _load(conn, instance)
     pct = float(data.get("context_pct") or 0)
     prof = conn.execute(
@@ -199,8 +203,33 @@ def context_health(conn, instance: str) -> dict:
     hint = ""
     if pct >= threshold:
         hint = f"上下文占用 {pct:.0f}%,建议先续接(14.2)"
+
+    # 池级耗尽排查(票 57): quota: 键中 exhausted=true 且非实例名即视为池耗尽
+    instance_exhausted = bool(data.get("exhausted"))
+    pool_exhausted = _pool_exhausted(conn, instance)
     return {"instance": instance, "pct": pct, "remaining": int(remaining),
-            "window": window, "hint": hint, "exhausted": bool(data.get("exhausted"))}
+            "window": window, "hint": hint,
+            "exhausted": instance_exhausted or pool_exhausted}
+
+
+def _pool_exhausted(conn, instance: str) -> bool:
+    """检查是否存在非实例名的 exhausted quota 条目（池级耗尽信号）。"""
+    known_instances = {r["name"] for r in conn.execute(
+        "SELECT name FROM instances").fetchall()}
+    for row in conn.execute(
+            "SELECT key, value FROM configs WHERE key LIKE 'quota:%'").fetchall():
+        key = row["key"][len("quota:"):]
+        if key == instance:
+            continue  # 实例级已由调用方处理
+        if key in known_instances:
+            continue  # 其他实例级,不干扰
+        try:
+            d = json.loads(row["value"])
+            if d.get("exhausted"):
+                return True
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return False
 
 
 def allocator_health_check(conn, task_id: int, expected_size: int,

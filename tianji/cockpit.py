@@ -337,7 +337,54 @@ def snapshot(conn: sqlite3.Connection) -> dict:
             -(card["last_message_ts"] or 0),
             card["instance_name"],
         ))
-    return buckets
+    pools = _build_pool_summary(conn)
+    result = dict(buckets)
+    result["pools"] = pools
+    return result
+
+
+def _build_pool_summary(conn: sqlite3.Connection) -> list:
+    """构建池摘要: 每池名/成员数/熔断中成员数/各成员健康状态。"""
+    summaries = []
+    pool_rows = conn.execute(
+        "SELECT key, value FROM configs "
+        "WHERE key LIKE 'pool:%' AND key NOT LIKE 'pool:token:%' "
+        "ORDER BY key"
+    ).fetchall()
+    for p in pool_rows:
+        name = p["key"][len("pool:"):]
+        try:
+            cfg = json.loads(p["value"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        raw_members = cfg.get("members", []) or []
+        circuit = cfg.get("circuit", {}) or {}
+        members_info = []
+        circuit_open = 0
+        for m in raw_members:
+            cb_state = "closed"
+            if m in circuit and isinstance(circuit[m], dict):
+                cb_state = circuit[m].get("state", "closed")
+            if cb_state == "open":
+                circuit_open += 1
+            hrow = conn.execute(
+                "SELECT consecutive_failures, last_error, "
+                "last_success_at, last_failure_at "
+                "FROM pool_member_health WHERE pool_name=? AND member_name=?",
+                (name, m)).fetchone()
+            members_info.append({
+                "name": m, "circuit": cb_state,
+                "consecutive_failures": hrow["consecutive_failures"] if hrow else 0,
+                "last_error": hrow["last_error"] if hrow else "",
+            })
+        summaries.append({
+            "name": name, "member_count": len(raw_members),
+            "circuit_open_count": circuit_open, "members": members_info,
+        })
+    return summaries
+
+
+
 
 
 def render_snapshot(snapshot: dict, extra_blocks: list | None = None) -> str:
@@ -345,10 +392,12 @@ def render_snapshot(snapshot: dict, extra_blocks: list | None = None) -> str:
     header_time = _utcfromtimestamp(current).strftime("%Y-%m-%d %H:%M:%S")
     upgrade_count = 0
     card_count = 0
-    for cards in snapshot.values():
+    for key, cards in snapshot.items():
+        if key == "pools":
+            continue
         for card in cards:
             card_count += 1
-            if card["has_escalation"]:
+            if card.get("has_escalation"):
                 upgrade_count += 1
 
     lines = [
@@ -424,5 +473,23 @@ def render_snapshot(snapshot: dict, extra_blocks: list | None = None) -> str:
         lines.append("## 插件展示块")
         lines.extend(extra_blocks)
         lines.append("")
+
+    # 票 57: 池摘要
+    pool_data = snapshot.get("pools")
+    if pool_data:
+        lines.append("## 号池摘要")
+        lines.append("")
+        for pool in pool_data:
+            status_tag = ""
+            if pool["circuit_open_count"] > 0:
+                status_tag = f" ⚠ 熔断中{pool['circuit_open_count']}/{pool['member_count']}"
+            lines.append(f"### {pool['name']}{status_tag}")
+            for m in pool["members"]:
+                dot = {"closed": "●", "open": "⚠", "half_open": "◐"}.get(
+                    m["circuit"], "●")
+                fail_note = f"(连续 FAIL {m['consecutive_failures']})" if m.get("consecutive_failures") else ""
+                lines.append(
+                    f"  {dot} {m['name']} {fail_note}")
+            lines.append("")
 
     return "\n".join(lines).strip() + "\n"
