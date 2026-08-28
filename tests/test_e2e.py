@@ -298,12 +298,18 @@ def test_pool_wizard_integration(tianji_home):
             resp = urllib.request.urlopen(req, timeout=10)
             assert resp.status == 200
             # pool_request_logs 落行(修B: 经池出活完整闭环)
-            conn.execute("PRAGMA wal_checkpoint")
-            logs = conn.execute(
-                "SELECT member_name, status_code, request_model, model"
-                " FROM pool_request_logs WHERE pool_name='test-pool'"
-                ).fetchall()
-            assert len(logs) > 0, "pool_request_logs 应有请求记录"
+            # 轮询兜底: 代理线程写日志可能在客户端收到 200 之后微秒级提交
+            import time as _time
+            logs = None
+            for _ in range(20):
+                logs = conn.execute(
+                    "SELECT member_name, status_code, request_model, model"
+                    " FROM pool_request_logs WHERE pool_name='test-pool'"
+                    ).fetchall()
+                if logs:
+                    break
+                _time.sleep(0.1)
+            assert logs, "pool_request_logs 应有请求记录"
             assert logs[0]["member_name"] == "cred1"
             assert logs[0]["status_code"] == 200
         finally:

@@ -673,6 +673,12 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     final_status = status
                     final_is_converted = is_converted
                     self.router.record(pool_name, member_name, True)
+                    # 落行在前(修时序): 客户端收到 200 时日志已提交
+                    _log_request(
+                        conn, pool_name, final_member, req_model, req_model,
+                        final_status, final_elapsed_ms, first_token_ms,
+                        final_input_tokens, final_output_tokens,
+                        final_is_stream, final_is_converted, session_id, request_id)
                     self._send_resp(status, resp_hdrs, resp_body)
                     _resp_sent = True
                     # 成功: 清池耗尽标记
@@ -689,8 +695,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     if exc.stream_broken:
                         break
 
-            # 一行日志: 取"产生最终结果的那次尝试"
-            if final_member:
+            # 一行日志: 取"产生最终结果的那次尝试"(成功路径已提前落行,此处仅兜底失败路径)
+            if final_member and not _resp_sent:
                 _log_request(
                     conn, pool_name, final_member, req_model, req_model,
                     final_status, final_elapsed_ms, first_token_ms,
