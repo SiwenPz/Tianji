@@ -187,6 +187,50 @@ CREATE TABLE IF NOT EXISTS session_states (
   last_seq INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+----------------------------------------------------------------------
+-- 票 57 池日志与信号第四层(号池 ③)
+----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pool_request_logs (
+  request_id TEXT NOT NULL,
+  pool_name TEXT NOT NULL,
+  member_name TEXT NOT NULL,
+  request_model TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  status_code INTEGER NOT NULL,
+  elapsed_ms REAL NOT NULL DEFAULT 0,
+  first_token_ms REAL NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  is_stream INTEGER NOT NULL DEFAULT 0,
+  is_converted INTEGER NOT NULL DEFAULT 0,
+  session_id TEXT NOT NULL DEFAULT '',
+  ts INTEGER NOT NULL,
+  PRIMARY KEY (request_id)
+);
+
+CREATE TABLE IF NOT EXISTS pool_daily_rollups (
+  rollup_date TEXT NOT NULL,
+  pool_name TEXT NOT NULL,
+  member_name TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  request_count INTEGER NOT NULL DEFAULT 0,
+  success_count INTEGER NOT NULL DEFAULT 0,
+  errors INTEGER NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (rollup_date, pool_name, member_name, model)
+);
+
+CREATE TABLE IF NOT EXISTS pool_member_health (
+  pool_name TEXT NOT NULL,
+  member_name TEXT NOT NULL,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_success_at INTEGER NOT NULL DEFAULT 0,
+  last_failure_at INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (pool_name, member_name)
+);
 """
 
 

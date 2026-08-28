@@ -281,10 +281,11 @@ class _FakeHandler(BaseHTTPRequestHandler):
     def log_message(self, *a, **kw):
         pass
 
-    # Inherit _do_route, _route, _send_resp, _send_json from real handler
+    # Inherit _do_route, _route, _do_route_impl, _send_resp, _send_json from real handler
     if _ProxyHandlerCls is not None:
         _do_route = _ProxyHandlerCls._do_route
         _route = _ProxyHandlerCls._route
+        _do_route_impl = _ProxyHandlerCls._do_route_impl
         _send_resp = _ProxyHandlerCls._send_resp
         _send_json = _ProxyHandlerCls._send_json
 
@@ -395,9 +396,9 @@ class TestProxyHandler:
             return 200, {"Content-Type": "application/json"}, b'{"ok":true}'
 
 
-        import tianji.proxy as proxy_mod
-        orig_fwd = proxy_mod._forward_http
-        proxy_mod._forward_http = _mock_fwd
+        from tianji.proxy import _pool as pool_mod
+        orig_fwd = pool_mod._forward_http
+        pool_mod._forward_http = _mock_fwd
         try:
             router = _FakeRouter.always(
                 "testcred",
@@ -409,7 +410,7 @@ class TestProxyHandler:
             h._do_route("POST")
             assert call_count[0] == 2  # 第一次 429 重试,第二次成功
         finally:
-            proxy_mod._forward_http = orig_fwd
+            pool_mod._forward_http = orig_fwd
 
     def test_stream_broken_no_retry(self, pctx):
         call_count = [0]
@@ -422,9 +423,9 @@ class TestProxyHandler:
             raise _ForwardError("stream_interrupted", detail="connection_reset",
                                 stream_broken=True)
 
-        import tianji.proxy as proxy_mod
-        orig_fwd = proxy_mod._forward_http
-        proxy_mod._forward_http = _mock_fwd
+        from tianji.proxy import _pool as pool_mod
+        orig_fwd = pool_mod._forward_http
+        pool_mod._forward_http = _mock_fwd
         try:
             router = _FakeRouter.always(
                 "testcred",
@@ -436,7 +437,7 @@ class TestProxyHandler:
             h._do_route("POST")
             assert call_count[0] == 1  # 流中断不重试
         finally:
-            proxy_mod._forward_http = orig_fwd
+            pool_mod._forward_http = orig_fwd
 
 
 # ---------------------------------------------------------------------------
