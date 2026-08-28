@@ -303,11 +303,17 @@ async def api_entry_delete(req: Request):
 
 @app.get("/api/pool/list")
 async def api_pool_list(req: Request):
-    """列出全部池(只读,含成员摘要)。"""
+    """列出全部池(只读,含成员摘要+可选 credential 列表)。"""
     conn = connect()
     try:
         pools = pool_mod.pool_list(conn)
-        return {"pools": pools}
+        all_creds = pool_mod.list_credential_names(conn)
+        # 过滤已在池中的 credential
+        pooled = set()
+        for p in pools:
+            pooled.update(p.get("members", []))
+        avail = [c for c in all_creds if c not in pooled]
+        return {"pools": pools, "available_credentials": avail}
     finally:
         conn.close()
 
@@ -1150,7 +1156,7 @@ async function renderPools(){
     <div class="row" style="gap:4px;margin-top:2px">
      <select class="pool-add-sel" data-pool="${esc(p.name)}" style="flex:1">
       <option value="">归入 credential …</option>
-      ${r.available_credentials||[]}.filter(c=>!members.includes(c)).map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join("")}
+      ${(r.available_credentials||[]).filter(c=>!members.includes(c)).map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join("")}
      </select>
      <button class="btn-ghost" onclick="addPoolMember('${esc(p.name)}')">加入</button>
      ${members.map(m=>`<button class="btn-ghost" style="padding:3px 8px;font-size:11px" onclick="removePoolMember('${esc(p.name)}','${esc(m)}')">-${esc(m)}</button>`).join("")}
@@ -1616,7 +1622,7 @@ function render(){
   +`<td>${esc(S.controller.model)}</td><td>总控</td></tr>`;
  for(const i of S.instances)
   rows+=`<tr><td>${esc(roleOf(i))}</td><td>${esc(i.shell)}</td>`
-   +`<td>${esc(i.model)}${i.key_name?" ["+esc(i.key_name)+"]":" [免key]"}</td>`
+   +`<td>${esc(i.model)}${i.key_name?" ["+esc(i.key_name)+"]":" [免key]"}${i.pool_note?" <span class='badge warn'>"+esc(i.pool_note)+"</span>":""}</td>`
    +`<td>${esc(i.name)}</td></tr>`;
  el("roster").innerHTML=rows
   ?`<table><tr><th>角色</th><th>助手</th><th>模型</th><th>实例名</th></tr>${rows}</table>`

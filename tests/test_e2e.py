@@ -162,56 +162,87 @@ def conn_rows(home, sql):
     conn.close()
     return [dict(r) for r in rows]
 
-
 def test_pool_wizard_integration(tianji_home):
-    """票59 号池闭环: 建池→入成员→实例 pool 绑定→渲染含池凭证。"""
+    """ticket59 pool e2e: build pool -> assign key -> instance bound to pool -> dispatch -> spawn."""
     from tianji.db import connect
     conn = connect()
     try:
         from tianji import ops, integrations, wizard, pool as pool_mod
+        from tianji.shellrender import render
         import secrets
         secret = secrets.token_hex(16)
         ops.ensure_defaults(conn)
-        # 注册总控
         rc = ops.instance_register(
-            conn, "总控", "claude", "deepseek-v4-flash", controller=True)
+            conn, "ctrl", "claude", "deepseek-v4-flash", controller=True)
         secret = rc["secret"]
-        ident = {"worker_id": "总控", "secret": secret}
-        # 确保内置 provider 已注册
+        ident = {"worker_id": "ctrl", "secret": secret}
         integrations.ensure_builtin_registry(conn, ident,
-                                             request_id="e2e-registry")
-        # 1. 登记凭据
-        cred_ref = str(tianji_home / "key1.txt")
-        Path(cred_ref).write_text("test-key-for-pool", encoding="utf-8")
-        integrations.register_credential(conn, ident, "cred1", "stepfun", key_ref=cred_ref,
-                                         request_id="e2e-cred-add")
-        # 2. 建池(含成员)
+                                             request_id="e2e-reg")
+        # 1. register credential
+        cred_ref = str(tianji_home / "pool-keys" / "c1.key")
+        Path(cred_ref).parent.mkdir(parents=True, exist_ok=True)
+        Path(cred_ref).write_text("upstream-key-42", encoding="utf-8")
+        integrations.register_credential(
+            conn, ident, "cred1", "stepfun", key_ref=cred_ref,
+            request_id="e2e-cred")
+        # 2. build pool with member
         r = pool_mod.pool_create(conn, ident, "test-pool",
                                   members=["cred1"],
-                                  request_id="e2e-pool-create")
+                                  request_id="e2e-pool")
         assert r["name"] == "test-pool"
         assert len(r["members"]) == 1
-        assert "token" in r and len(r["token"]) == 64
-        # 3. 用 pool 名作 key_name 新增实例
-        iso = tianji_home / "instances" / "审核1-claude"
-        inst = wizard.add_instance(conn, ident, "审核1", "claude",
+        pool_token = r["token"]
+        assert len(pool_token) == 64
+        # 预置 proxy 端口(模拟 daemon 已启动)
+        ops.config_set(conn, ident, "daemon.proxy_port", "9876",
+                       request_id="e2e-proxy-port")
+        # 3. create instance bound to pool
+        iso = tianji_home / "instances" / "rev1-claude"
+        inst = wizard.add_instance(conn, ident, "rev1", "claude",
                                     "deepseek-v4-flash", key_name="test-pool",
                                     isolated_dir=str(iso),
                                     skip_test=True, confirm=True,
-                                    request_id="e2e-pool-inst")
-        assert inst["name"] == "审核1"
+                                    request_id="e2e-inst")
+        assert inst["name"] == "rev1"
         assert inst["registered"] is True
-        # pool_note 确认 pool 名已处理
-        # 4. 通过 shellrender 渲染启动命令(含池 token)
-        cmd = render(conn, "claude", instance="审核1", model="deepseek-v4-flash",
-                     key_name="test-pool", isolated_dir=str(iso))
-        assert isinstance(cmd, tuple)
+        # 4. render launch_cmd with pool token
+        cmd = render(conn, "claude", instance="rev1",
+                      model="deepseek-v4-flash", key_name="test-pool",
+                      isolated_dir=str(iso))
         launch_cmd, arts = cmd
-        assert "settings" in launch_cmd  # claude 走 settings 文件
-        assert len(arts) >= 1  # settings.json 落盘
-        # 5. 搜 pool list 确认 member 数不变
-        pools = pool_mod.pool_list(conn)
-        pool_names = {p["name"] for p in pools}
-        assert "test-pool" in pool_names
+        assert "settings" in launch_cmd
+        settings_data = json.loads(Path(arts[0]).read_text(encoding="utf-8"))
+        assert settings_data["env"]["ANTHROPIC_AUTH_TOKEN"] == pool_token
+        assert "127.0.0.1" in settings_data["env"]["ANTHROPIC_BASE_URL"]
+        # 5. dispatch + spawn
+        task = _invoke(["task", "new", "pool-e2e-task",
+                        "--description", "full pool chain",
+                        "--request-id", "e2e-new-task"],
+                       env=env_ctrl(secret, str(tianji_home)))
+        tid = task["task_id"]
+        for s in ("discussing", "awaiting_plan_confirm"):
+            _invoke(["task", "transition", str(tid), s,
+                     "--request-id", f"e2e-{s}"],
+                    env=env_ctrl(secret, str(tianji_home)))
+        _invoke(["task", "verify-cmd", str(tid), "echo ok",
+                 "--request-id", "e2e-vcmd"],
+                env=env_ctrl(secret, str(tianji_home)))
+        _invoke(["task", "transition", str(tid), "dispatched",
+                 "--request-id", "e2e-dispatch"],
+                env=env_ctrl(secret, str(tianji_home)))
+        dp = _invoke(["dispatch", "issue", str(tid), "rev1",
+                       "--request-id", "e2e-issue"],
+                      env=env_ctrl(secret, str(tianji_home)))
+        sp = _invoke(["spawn", "rev1", str(dp["dispatch_id"])],
+                      env=env_ctrl(secret, str(tianji_home)))
+        assert Path(sp["taskbook"]).is_file()
+        assert sp["env"]["TIANJI_WORKER_ID"] == "rev1"
+        assert sp["env"]["TIANJI_DISPATCH_ID"] == str(dp["dispatch_id"])
     finally:
         conn.close()
+
+
+def env_ctrl(secret, home):
+    return {"TIANJI_WORKER_ID": "ctrl", "TIANJI_SECRET": secret, "TIANJI_HOME": home}
+
+

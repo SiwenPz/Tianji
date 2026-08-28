@@ -220,6 +220,14 @@ def pool_list(conn) -> list:
     return pools
 
 
+def list_credential_names(conn) -> list:
+    """列出全部已登记 credential 名称(只读)。"""
+    return [r["key"][len("credential:"):]
+            for r in conn.execute(
+                "SELECT key FROM configs WHERE key LIKE 'credential:%'"
+            ).fetchall()]
+
+
 def pool_status(conn, name: str) -> dict:
     """查池详情+令牌状态(只读)。"""
     pool = _read_pool(conn, name)

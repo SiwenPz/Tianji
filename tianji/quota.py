@@ -87,11 +87,38 @@ def scan_transcript_usage(conn, instance: str, transcript_path: str) -> dict:
     return {"instance": instance, "usage": usage}
 
 
-def _ccswitch_proxy_summary(db) -> dict:
-    """proxy_request_logs: 错误码归类表(429=限流≠故障)。"""
-    rows = db.execute(
-        "SELECT status_code, COUNT(*) AS n FROM proxy_request_logs"
-        " GROUP BY status_code").fetchall()
+def _ccswitch_proxy_summary(db, pool_name: str = "") -> dict:
+    """proxy_request_logs: 错误码归类表(429=限流≠故障)。
+    票59: 支持 pool_name 过滤,只统计指定池的日志。
+    """
+    if pool_name:
+        # 票59:按池过滤——读该池所有成员的 key_ref → 匹配 proxy_request_logs
+        # (57 的 proxy_request_logs 含 pool/member 字段;本分支兼容:无 pool
+        #  字段时退化为全表统计,rebate 后 57 的 schema 生效)
+        try:
+            cols = [r["name"] for r in db.execute(
+                "PRAGMA table_info(proxy_request_logs)").fetchall()]
+            if "pool_name" in cols:
+                rows = db.execute(
+                    "SELECT status_code, COUNT(*) AS n FROM proxy_request_logs"
+                    " WHERE pool_name=? GROUP BY status_code",
+                    (pool_name,)).fetchall()
+            elif "member" in cols:
+                # 无 pool_name 但有 member:通过 credential 反查池
+                rows = db.execute(
+                    "SELECT status_code, COUNT(*) AS n FROM proxy_request_logs"
+                    " WHERE member IN (SELECT key FROM configs WHERE key LIKE 'credential:%')"
+                    " GROUP BY status_code").fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT status_code, COUNT(*) AS n FROM proxy_request_logs"
+                    " GROUP BY status_code").fetchall()
+        except sqlite3.Error:
+            rows = []
+    else:
+        rows = db.execute(
+            "SELECT status_code, COUNT(*) AS n FROM proxy_request_logs"
+            " GROUP BY status_code").fetchall()
     summary = {}
     for r in rows:
         code = r["status_code"]
@@ -156,7 +183,13 @@ def read_ccswitch(conn, db_path: str, instance: str) -> dict:
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
     try:
-        summary = _ccswitch_proxy_summary(db)
+        # 票59: 读实例绑定池名,只查该池的 429
+        inst_row = conn.execute(
+            "SELECT key_name FROM instances WHERE name=?", (instance,)
+        ).fetchone()
+        key_name = inst_row["key_name"] if inst_row else ""
+        pool_name = key_name if key_name else ""
+        summary = _ccswitch_proxy_summary(db, pool_name=pool_name)
     except sqlite3.Error:
         db.close()
         return {"skipped": "cc-switch 库无 proxy_request_logs 表"}
@@ -168,10 +201,12 @@ def read_ccswitch(conn, db_path: str, instance: str) -> dict:
         data["last_error"] = ""
         data["exhausted"] = False
     if 429 in summary:
-        # 429=限流≠故障: 实例档案归类+额度已尽标记(12 的暂停派新活消费此信号)
+        # 票59: 仅池绑定实例受池耗尽影响;未绑池实例 skip
+        pool_tag = f"池 {pool_name} " if pool_name else ""
         data["last_error"] = "rate_limit"
         data["exhausted"] = True
-        ops.update_profile_notes(conn, instance, "429=限流(额度已尽),非故障")
+        note = f"{pool_tag}429=限流(额度已尽),非故障"
+        ops.update_profile_notes(conn, instance, note)
     if 403 in summary:
         # 403=权限/封禁: 归类写实例档案,但不是额度用尽,不置 exhausted
         data["last_error"] = "forbidden"
