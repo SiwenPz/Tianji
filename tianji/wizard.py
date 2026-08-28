@@ -216,6 +216,19 @@ def add_instance(conn, ident, name, shell, model, key_name="",
     if entry.get("binding") not in ("env", "config"):
         raise ValueError(f"未知壳 {shell}(新壳先走 new-shell-onboarding 八问检查单)")
 
+    # 票59:未给 key_name 且存在池时,默认进第一个池
+    pool_default_note = ""
+    if not key_name:
+        pools = integrations._pool_list_conn(conn)
+        if pools:
+            key_name = pools[0]["name"]
+            pool_default_note = f"未指定 key,默认进池 {key_name}"
+
+    is_pool = bool(key_name) and integrations._is_pool_name(conn, key_name)
+    # 票59:直绑路径加"不推荐"提示
+    if key_name and not is_pool:
+        pool_default_note = f"直绑 {key_name}(不推荐:建议通过池分配)"
+
     # 幂等(3.3): 各子操作各自单事务,本函数不包大事务(防 BEGIN 嵌套)
     if request_id:
         rc = conn.execute("SELECT result FROM receipts WHERE request_id=?",
@@ -229,8 +242,9 @@ def add_instance(conn, ident, name, shell, model, key_name="",
         ops.config_set(conn, ident, f"shell:{shell}",
                        json.dumps(SHELL_ENTRY_DEFAULTS[shell],
                                   ensure_ascii=False),
-                       request_id=f"{request_id}-shell" if request_id else None)
-    if key_name:
+                       request_id=f"{request_id}-shell" if
+                       request_id else None)
+    if key_name and not is_pool:
         krow = conn.execute("SELECT value FROM configs WHERE key=?",
                             (f"key:{key_name}",)).fetchone()
         if krow is None:
@@ -243,7 +257,8 @@ def add_instance(conn, ident, name, shell, model, key_name="",
                 "protocol": protocol or "openai",
                 "key_ref": key_ref or None,
                 "coding_plan": False}, ensure_ascii=False),
-                request_id=f"{request_id}-key" if request_id else None)
+                request_id=f"{request_id}-key" if request_id
+                else None)
     # ①' 装配校验(13.8): 凭据路径缺注册表条目且数据不足以显式登记→指路,
     # 不静默拼装一次性混合配置(免 key 实例不要求凭据条目)
     _require_integration_registry(conn, shell, key_name, base_url=base_url,
@@ -262,9 +277,12 @@ def add_instance(conn, ident, name, shell, model, key_name="",
     # ③ 呈现: 质量档位(配对现存实例)
     tiers = quality_tiers(conn, shell, key_name)
     if not confirm:
-        return {"name": name, "status": "待确认",
+        resp = {"name": name, "status": "待确认",
                 "quality_tiers": tiers, "present": present(conn),
                 "registered": False}
+        if pool_default_note:
+            resp["pool_note"] = pool_default_note
+        return resp
     # ④ 确认生成: 集成条目显式增量登记(13.8)+启动器+隔离配置+注册+画像+应然清单
     srow = conn.execute("SELECT value FROM configs WHERE key=?",
                         (f"shell:{shell}",)).fetchone()
@@ -290,11 +308,14 @@ def add_instance(conn, ident, name, shell, model, key_name="",
         "name": name, "shell": shell, "model": model,
         "key_name": key_name, "status": "已注册",
         "launch_cmd": launch_cmd, "artifacts": artifacts,
-        "quality_tiers": tiers, "by": ident["worker_id"]})
+        "quality_tiers": tiers, "by": ident["worker_id"],
+        "pool_note": pool_default_note})
     result = {"name": name, "status": "已注册",
               "launch_cmd": launch_cmd, "artifacts": artifacts,
               "quality_tiers": tiers,
               "secret_note": r["note"], "registered": True}
+    if pool_default_note:
+        result["pool_note"] = pool_default_note
     if request_id:
         conn.execute(
             "INSERT INTO receipts (request_id, operation, result) VALUES (?,?,?)",

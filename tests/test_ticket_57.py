@@ -260,10 +260,20 @@ class _BackendAlways429(BaseHTTPRequestHandler):
 class TestExhaustionSignal:
 
     def test_all_429_pool_exhausted(self, pconn, pctx):
-        """全员返回 429 → 502 → pool exhausted → context_health exhausted."""
+        """全员返回 429 → 502 → pool exhausted → context_health exhausted。
+
+        修A: 仅绑池实例 exhausted=true, 未绑实例不受影响。
+        """
         pool_token = pconn.execute(
             "SELECT value FROM configs WHERE key=?",
             ("pool:token:" + pctx["pool_name"],)).fetchone()["value"]
+
+        # 修A: 注册绑池实例 + 未绑实例用于 per-instance 断言
+        bound_inst = ops.instance_register(
+            pconn, "池绑定测试机", "claude", "deepseek-v4-flash",
+            key_name=pctx["pool_name"])
+        ops.instance_register(
+            pconn, "bystander", "claude", "deepseek-v4-flash")
 
         backend = HTTPServer(("127.0.0.1", 0), _BackendAlways429)
         backend_port = backend.server_address[1]
@@ -327,9 +337,11 @@ class TestExhaustionSignal:
                 qdata = json.loads(qrow["value"])
                 assert qdata.get("exhausted") is True
 
-                # context_health 检测到池耗尽
-                h = context_health(pconn, "any-instance")
-                assert h["exhausted"] is True
+                # context_health: 仅绑池实例 exhausted=true, 未绑实例不受影响(修A)
+                h = context_health(pconn, bound_inst["name"])
+                assert h["exhausted"] is True, f"绑池实例应 exhausted, got {h}"
+                h_by = context_health(pconn, "bystander")
+                assert h_by["exhausted"] is False, "未绑池实例不应 exhausted (修A)"
             finally:
                 pt.join(timeout=2)
                 _clear_pool_exhausted(pconn, pctx["pool_name"])
@@ -373,6 +385,13 @@ class TestPoolRecovery:
             "SELECT value FROM configs WHERE key=?",
             ("pool:token:" + pctx["pool_name"],)).fetchone()["value"]
 
+        # 修A: 注册绑池实例 + 未绑实例用于 per-instance 断言
+        bound_inst = ops.instance_register(
+            pconn, "池绑定测试机", "claude", "deepseek-v4-flash",
+            key_name=pctx["pool_name"])
+        ops.instance_register(
+            pconn, "bystander", "claude", "deepseek-v4-flash")
+
         # ── 共享 proxy (避免端口残留) ──
         proxy_port = 19006
         pt = threading.Thread(
@@ -414,8 +433,11 @@ class TestPoolRecovery:
                 assert qrow is not None
                 assert json.loads(qrow["value"]).get("exhausted") is True
 
-                h = context_health(pconn, "any-instance")
-                assert h["exhausted"] is True
+                # 修A: 仅绑池实例 exhausted=true, 未绑实例不受影响
+                h = context_health(pconn, bound_inst["name"])
+                assert h["exhausted"] is True, f"绑池实例应 exhausted, got {h}"
+                h_by = context_health(pconn, "bystander")
+                assert h_by["exhausted"] is False, "未绑池实例不应 exhausted (修A)"
             finally:
                 backend429.shutdown()
 
@@ -451,8 +473,11 @@ class TestPoolRecovery:
                     ("quota:" + pctx["pool_name"],)).fetchone()
                 assert qrow2 is None, "恢复后 quota 条目应已清除"
 
-                h2 = context_health(pconn, "any-instance")
-                assert h2["exhausted"] is False
+                # 修A: 恢复后绑池实例 exhausted=False, 未绑实例恒 False
+                h2 = context_health(pconn, bound_inst["name"])
+                assert h2["exhausted"] is False, f"恢复后绑池实例应不 exhausted, got {h2}"
+                h2_by = context_health(pconn, "bystander")
+                assert h2_by["exhausted"] is False
             finally:
                 backend200.shutdown()
         finally:

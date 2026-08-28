@@ -5,9 +5,15 @@
 
 import json
 import os
+import threading
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from typer.testing import CliRunner
+
+from tianji.shellrender import render
 
 from tianji.cli import app
 
@@ -159,3 +165,161 @@ def conn_rows(home, sql):
     rows = conn.execute(sql).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+def test_pool_wizard_integration(tianji_home):
+    """ticket59 pool e2e: build pool -> assign key -> instance bound to pool -> dispatch -> spawn."""
+    from tianji.db import connect
+    conn = connect()
+    try:
+        from tianji import ops, integrations, wizard, pool as pool_mod
+        from tianji.shellrender import render
+        import secrets
+        secret = secrets.token_hex(16)
+        ops.ensure_defaults(conn)
+        rc = ops.instance_register(
+            conn, "ctrl", "claude", "deepseek-v4-flash", controller=True)
+        secret = rc["secret"]
+        ident = {"worker_id": "ctrl", "secret": secret}
+        integrations.ensure_builtin_registry(conn, ident,
+                                             request_id="e2e-reg")
+        # 1. register provider + credential (显式关联,proxy 需要)
+        integrations.register_custom_provider(
+            conn, ident, "e2e-prov",
+            base_url="http://127.0.0.1:19999",
+            protocol="openai_chat",
+            auth_style="bearer",
+            request_id="e2e-prov")
+        cred_ref = str(tianji_home / "pool-keys" / "c1.key")
+        Path(cred_ref).parent.mkdir(parents=True, exist_ok=True)
+        Path(cred_ref).write_text("upstream-key-42", encoding="utf-8")
+        integrations.register_credential(
+            conn, ident, "cred1", "e2e-prov", key_ref=cred_ref,
+            request_id="e2e-cred")
+        # 2. build pool with member
+        r = pool_mod.pool_create(conn, ident, "test-pool",
+                                  members=["cred1"],
+                                  request_id="e2e-pool")
+        assert r["name"] == "test-pool"
+        assert len(r["members"]) == 1
+        pool_token = r["token"]
+        assert len(pool_token) == 64
+        # 预置 proxy 端口(模拟 daemon 已启动)
+        ops.config_set(conn, ident, "daemon.proxy_port", "9876",
+                       request_id="e2e-proxy-port")
+        # 3. create instance bound to pool
+        iso = tianji_home / "instances" / "rev1-claude"
+        inst = wizard.add_instance(conn, ident, "rev1", "claude",
+                                    "deepseek-v4-flash", key_name="test-pool",
+                                    isolated_dir=str(iso),
+                                    skip_test=True, confirm=True,
+                                    request_id="e2e-inst")
+        assert inst["name"] == "rev1"
+        assert inst["registered"] is True
+        # 4. render launch_cmd with pool token
+        cmd = render(conn, "claude", instance="rev1",
+                      model="deepseek-v4-flash", key_name="test-pool",
+                      isolated_dir=str(iso))
+        launch_cmd, arts = cmd
+        assert "settings" in launch_cmd
+        settings_data = json.loads(Path(arts[0]).read_text(encoding="utf-8"))
+        assert settings_data["env"]["ANTHROPIC_AUTH_TOKEN"] == pool_token
+        assert "127.0.0.1" in settings_data["env"]["ANTHROPIC_BASE_URL"]
+        # 5. dispatch + spawn
+        task = _invoke(["task", "new", "pool-e2e-task",
+                        "--description", "full pool chain",
+                        "--request-id", "e2e-new-task"],
+                       env=env_ctrl(secret, str(tianji_home)))
+        tid = task["task_id"]
+        for s in ("discussing", "awaiting_plan_confirm"):
+            _invoke(["task", "transition", str(tid), s,
+                     "--request-id", f"e2e-{s}"],
+                    env=env_ctrl(secret, str(tianji_home)))
+        _invoke(["task", "verify-cmd", str(tid), "echo ok",
+                 "--request-id", "e2e-vcmd"],
+                env=env_ctrl(secret, str(tianji_home)))
+        _invoke(["task", "transition", str(tid), "dispatched",
+                 "--request-id", "e2e-dispatch"],
+                env=env_ctrl(secret, str(tianji_home)))
+        dp = _invoke(["dispatch", "issue", str(tid), "rev1",
+                       "--request-id", "e2e-issue"],
+                      env=env_ctrl(secret, str(tianji_home)))
+        sp = _invoke(["spawn", "rev1", str(dp["dispatch_id"])],
+                      env=env_ctrl(secret, str(tianji_home)))
+        assert Path(sp["taskbook"]).is_file()
+        assert sp["env"]["TIANJI_WORKER_ID"] == "rev1"
+        assert sp["env"]["TIANJI_DISPATCH_ID"] == str(dp["dispatch_id"])
+
+        # 6. 真 proxy round-trip: 建池→绑池→经池出活落日志(修B)
+        from tianji.proxy._pool import run_proxy
+        class _BackendAlways200(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.dumps({
+                    "id": "chatcmpl-1", "object": "chat.completion",
+                    "created": 1234567890,
+                    "model": "test-model", "choices": [{"index": 0, "message": {
+                        "role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a, **kw):
+                pass
+
+        backend = HTTPServer(("127.0.0.1", 0), _BackendAlways200)
+        backend_port = backend.server_address[1]
+        bt = threading.Thread(target=backend.serve_forever, daemon=True)
+        bt.start()
+        # 务必将 provider base_url 指向 mock 上游
+        prov_entry = ops._config(conn, "integration_provider:e2e-prov")
+        if isinstance(prov_entry, str):
+            prov_entry = json.loads(prov_entry)
+        prov_entry["base_url"] = f"http://127.0.0.1:{backend_port}"
+        conn.execute(
+            "UPDATE configs SET value=? WHERE key=?",
+            (json.dumps(prov_entry, ensure_ascii=False),
+             "integration_provider:e2e-prov"))
+
+        proxy_port = 19008
+        pt = threading.Thread(
+            target=run_proxy, args=(proxy_port,), daemon=True)
+        pt.start()
+        try:
+            import time as _time
+            _time.sleep(0.5)
+            body = json.dumps({"model": "test-model"}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_port}/proxy/test-pool"
+                f"/v1/chat/completions?token={pool_token}",
+                data=body, headers={"Content-Type": "application/json"},
+                method="POST")
+            resp = urllib.request.urlopen(req, timeout=10)
+            assert resp.status == 200
+            # pool_request_logs 落行(修B: 经池出活完整闭环)
+            # 轮询兜底: 代理线程写日志可能在客户端收到 200 之后微秒级提交
+            import time as _time
+            logs = None
+            for _ in range(20):
+                logs = conn.execute(
+                    "SELECT member_name, status_code, request_model, model"
+                    " FROM pool_request_logs WHERE pool_name='test-pool'"
+                    ).fetchall()
+                if logs:
+                    break
+                _time.sleep(0.1)
+            assert logs, "pool_request_logs 应有请求记录"
+            assert logs[0]["member_name"] == "cred1"
+            assert logs[0]["status_code"] == 200
+        finally:
+            pt.join(timeout=2)
+            backend.shutdown()
+    finally:
+        conn.close()
+
+
+def env_ctrl(secret, home):
+    return {"TIANJI_WORKER_ID": "ctrl", "TIANJI_SECRET": secret, "TIANJI_HOME": home}
+
+

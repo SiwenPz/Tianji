@@ -98,6 +98,23 @@ def _read_key(key_ref: str) -> str:
     return p.read_text(encoding="utf-8").strip() if p.is_file() else ""
 
 
+def _pool_token(conn, name: str) -> str:
+    """Read pool token from configs table."""
+    row = conn.execute(
+        "SELECT value FROM configs WHERE key=?", (f"pool:token:{name}",)
+    ).fetchone()
+    return row["value"] if row else ""
+
+
+def _pool_proxy_url(conn) -> str:
+    """Proxy base_url from daemon config."""
+    row = conn.execute(
+        "SELECT value FROM configs WHERE key=?", ("daemon.proxy_port",)
+    ).fetchone()
+    port = (row["value"] if row else "").strip()
+    return f"http://127.0.0.1:{port}" if port else ""
+
+
 # ---------------------------------------------------------------- renderers
 
 RENDERERS: dict[str, Callable] = {}
@@ -177,14 +194,41 @@ def _render_codex(ctx):
 
 @renderer("config_binding")
 def _render_config_binding(ctx):
-    """壳内配置型(config_binding morph): key 留各壳配置域,启动器=调壳的薄命令。"""
+    """壳内配置型(config_binding morph): key 留各壳配置域,启动器=调壳的薄命令。
+
+    票59: 池绑定时通过 provider_env.map 数据驱动注入 proxy/凭证环境变量,
+    不碰具体壳名。
+    """
     entry = ctx.get("entry") or {}
     env_name = entry.get("worker_data_root_env") or ""
+    cmd = ctx["shell"]
+
+    # provider_env.process_env: 按 entry 内 map 模板注入 env(数据驱动)
+    prov_env = (entry.get("provider_env") or {}).get("map") or {}
+    key_txt = _read_key(ctx.get("key_ref", ""))
+    fmt = {
+        "key": key_txt,
+        "model": ctx.get("model", ""),
+        "base_url": ctx.get("base_url", ""),
+        "protocol": "",
+    }
+    prefix_parts = []
+    for var, tpl in prov_env.items():
+        try:
+            val = tpl.format(**fmt)
+        except (KeyError, ValueError):
+            val = ""
+        if val:
+            ec = var[1:] if var.startswith("$") else var
+            prefix_parts.append(f"set {ec}={val}")
+    if prefix_parts:
+        cmd = "&& ".join(prefix_parts) + "&& " + cmd
+
+    _arts = [ctx.get("key_ref", "")] if ctx.get("key_ref") else []
     if env_name and ctx["isolated_dir"]:
         return (f'cmd /c "set {env_name}={ctx["isolated_dir"]}&& '
-                f'{ctx["shell"]}"', [])
-    return ctx["shell"], []
-
+                f'{cmd}"'), _arts
+    return cmd, _arts
 
 def render(conn, shell, instance="", model="", key_name="", isolated_dir="",
            entry=None):
@@ -196,6 +240,20 @@ def render(conn, shell, instance="", model="", key_name="", isolated_dir="",
     if fn is None:
         raise ValueError(f"壳 {shell} 的 morph={morph} 无渲染器实现")
     _, _, key_ref, base_url = resolve_credential(conn, key_name)
+    # ---- 池名回退(票59) --------------------------------------
+    if not key_ref and key_name and isolated_dir:
+        pool_row = conn.execute(
+            "SELECT key FROM configs WHERE key=?",
+            (f"pool:{key_name}",)).fetchone()
+        if pool_row is not None:
+            token = _pool_token(conn, key_name)
+            if token:
+                iso = Path(isolated_dir)
+                iso.mkdir(parents=True, exist_ok=True)
+                tf = iso / "pool-token.key"
+                tf.write_text(token, encoding="utf-8")
+                key_ref = str(tf)
+                base_url = _pool_proxy_url(conn) or base_url
     if entry is None:
         row = conn.execute("SELECT value FROM configs WHERE key=?",
                            (f"integration_shell:{shell}",)).fetchone()
