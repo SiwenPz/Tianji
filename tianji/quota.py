@@ -15,7 +15,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-from . import messages, ops
+from . import integrations, messages, ops
 from .db import now
 
 # 错误码归类(14.1③): 429=限流≠故障
@@ -248,23 +248,29 @@ def context_health(conn, instance: str) -> dict:
 
 
 def _pool_exhausted(conn, instance: str) -> bool:
-    """检查是否存在非实例名的 exhausted quota 条目（池级耗尽信号）。"""
-    known_instances = {r["name"] for r in conn.execute(
-        "SELECT name FROM instances").fetchall()}
-    for row in conn.execute(
-            "SELECT key, value FROM configs WHERE key LIKE 'quota:%'").fetchall():
-        key = row["key"][len("quota:"):]
-        if key == instance:
-            continue  # 实例级已由调用方处理
-        if key in known_instances:
-            continue  # 其他实例级,不干扰
-        try:
-            d = json.loads(row["value"])
-            if d.get("exhausted"):
-                return True
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return False
+    """按实例收口(修A): 仅实例绑定的池耗尽时才置 exhausted。
+
+    1. 读实例 key_name: 不存在/为空 → return False(未绑池实例不受影响)
+    2. key_name 是池名 → 查 quota:<pool_name> exhausted
+    3. key_name 不是池名(直绑 key) → return False
+    """
+    row = conn.execute(
+        "SELECT key_name FROM instances WHERE name=?",
+        (instance,)).fetchone()
+    key_name = (row["key_name"] if row else "") or ""
+    if not key_name:
+        return False
+    if not integrations._is_pool_name(conn, key_name):
+        return False
+    qrow = conn.execute(
+        "SELECT value FROM configs WHERE key=?",
+        ("quota:" + key_name,)).fetchone()
+    if qrow is None:
+        return False
+    try:
+        return bool(json.loads(qrow["value"]).get("exhausted"))
+    except (json.JSONDecodeError, TypeError):
+        return False
 
 
 def allocator_health_check(conn, task_id: int, expected_size: int,
