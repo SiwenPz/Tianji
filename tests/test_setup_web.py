@@ -349,3 +349,32 @@ def test_generic_settings_carries_ctrl_session_when_present(home):
         encoding="utf-8"))
     assert doc["ctrl_session"]["protocol"] == "acp"
     assert doc["ctrl_session"]["launch"] == ["kimi", "acp"]
+
+
+def test_land_with_pool_no_crash_when_all_exist(client, home):
+    """票59 归池 NameError: count<=have(无需新建实例)时 pool_add_member 不抛 NameError。"""
+    from tianji import pool as pool_mod
+    client.post("/api/setup/controller", json={
+        "shell": "claude", "source": "builtin"})
+    ident = {"worker_id": "总控",
+             "secret": (injected_dir() / "ctrl-secret.txt").read_text(
+                 encoding="utf-8").strip()}
+    conn = connect()
+    pool_mod.pool_create(conn, ident, "wp01", members=[], request_id="p1")
+    conn.close()
+    r = client.post("/api/setup/land", json={"cards": [
+        {"shell": "codex", "source": "key", "provider": "deepseek",
+         "protocol": "openai_chat",
+         "base_url": "https://api.deepseek.com/v1",
+         "key_value": "sk-wp", "model": "deepseek-chat",
+         "role": "审核", "count": 2, "pool": "wp01"}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["registered"] == ["审核1", "审核2"]
+    r2 = client.post("/api/setup/land", json={"cards": [
+        {"shell": "codex", "source": "key", "provider": "deepseek",
+         "protocol": "openai_chat",
+         "base_url": "https://api.deepseek.com/v1",
+         "key_value": "sk-wp", "model": "deepseek-chat",
+         "role": "审核", "count": 2, "pool": "wp01"}]})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["registered"] == []

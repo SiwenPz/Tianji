@@ -188,11 +188,34 @@ def _review_section(conn, dispatch: dict) -> str:
                 ]
             else:
                 lines += [
-                    "- **非 git 项目降级项(8.4 维度 2)**: 机械边界比对不可用,"
-                    "请人工核对产物实际改动路径是否都在改动边界声明内: "
+                    "- **非 git 项目降级项: 机械边界对比不可用，请人工核对实际改动路径是否在声明范围: "
                     + ", ".join(f"`{p}`" for p in json.loads(raw_scope)),
                     "",
                 ]
+    # 质量轴清单注入(8.4,票 14 打磨): 只往质量轴审核任务书注入,spec 轴不塞;
+    # 清单正文读 configs quality_axis_checklist 当前生效值(默认 ops.DEFAULTS,
+    # 总控改了配置任务书跟着变),不再硬编码。
+    if axis == "quality":
+        cl_row = conn.execute(
+            "SELECT value FROM configs WHERE key='quality_axis_checklist'"
+        ).fetchone()
+        try:
+            checklist = json.loads(cl_row["value"]) if cl_row else []
+        except json.JSONDecodeError:
+            checklist = []
+        if checklist:
+            if lang == "en":
+                lines.append("### Quality Axis Checklist(8.4, current effective)")
+            else:
+                lines.append("### 质量轴审核清单(8.4,当前生效)")
+            for i, item in enumerate(checklist, 1):
+                if isinstance(item, dict):
+                    lines.append(f"  {i}. {item.get('dimension', '')}")
+                    for chk in item.get("checks", []):
+                        lines.append(f"     - {chk}")
+                else:
+                    lines.append(f"  {i}. {item}")
+            lines.append("")
     return "\n".join(lines)
 
 
@@ -357,6 +380,43 @@ def _lang_fallback_tag(lang: str) -> str:
     return ""
 
 
+
+def _render_breakpoint_section(dispatch: dict, lang: str) -> str:
+    """断点摘要节: 有内容才渲染,没内容跳过不空。"""
+    try:
+        payload = json.loads(dispatch.get("payload") or "{}")
+    except Exception:
+        return ""
+    bs = payload.get("breakpoint_summary")
+    if not bs or not isinstance(bs, dict):
+        return ""
+    # 按语言渲染标题
+    if lang == "en":
+        lines = ["\n## Breakpoint Summary\n"]
+        tail = bs.get("transcript_tail", "")
+        if tail:
+            lines.append("### Last Session Transcript Tail\n```")
+            lines.append(tail)
+            lines.append("```")
+        lines.append("### Artifacts from Previous Session\n")
+        for a in bs.get("artifacts", []):
+            lines.append(f"- {a}")
+        lines.append("\n")
+        return "\n".join(lines)
+    else:
+        lines = ["\n## 断点摘要(7.5)\n"]
+        tail = bs.get("transcript_tail", "")
+        if tail:
+            lines.append("### 上一轮转录尾部\n```")
+            lines.append(tail)
+            lines.append("```")
+        lines.append("### 上一轮产物清单\n")
+        for a in bs.get("artifacts", []):
+            lines.append(f"- {a}")
+        lines.append("\n")
+        return "\n".join(lines)
+
+
 def _render_taskbook(conn, dispatch: dict, task: dict, report_path: str) -> str:
     lang = _resolve_language(conn)
     template = _TASKBOOK_TEMPLATES.get(lang,
@@ -377,7 +437,7 @@ def _render_taskbook(conn, dispatch: dict, task: dict, report_path: str) -> str:
                          + "\n".join(f"- `{p}`" for p in prefixes))
     else:
         scope_section = "(未声明——架构师在计划确认前必写,11.2)"
-    return template.format(
+    result = template.format(
         dispatch_id=dispatch["id"], task_id=task["id"], title=task["title"],
         description=description,
         verify_cmd=task["verify_cmd"] or "(未配置)",
@@ -386,6 +446,8 @@ def _render_taskbook(conn, dispatch: dict, task: dict, report_path: str) -> str:
         settle_cmd=settle_cmd, review_section=review_section,
         rework_section=_rework_section(conn, dispatch),
     ) + fallback_tag
+    result += _render_breakpoint_section(dispatch, lang)
+    return result
 
 
 def spawn(conn: sqlite3.Connection, instance_name: str, dispatch_id: int,
@@ -436,6 +498,18 @@ def spawn(conn: sqlite3.Connection, instance_name: str, dispatch_id: int,
     try:
         from . import hooks
         hooks.reconcile_instance(conn, instance_name)
+    except Exception:
+        pass
+    # 插件对账(21.4,票 14 打磨): 与钩子对账同点,启用的模板类插件逐个对账,
+    # 三态语义沿用 plugins.reconcile(缺失/旧版机械重生成,用户改过不碰+升级)
+    try:
+        from . import plugins
+        for p in plugins.list_plugins(conn):
+            if p.get("type") == "template" and p.get("enabled", True):
+                try:
+                    plugins.reconcile(conn, p["name"])
+                except Exception:
+                    pass
     except Exception:
         pass
     env = os.environ.copy()

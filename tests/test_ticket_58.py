@@ -13,13 +13,24 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 
+from tianji import ops
 from tianji.proxy import convert, stream
+from tianji.proxy._pool import run_proxy
+from tianji.integrations import (
+    register_custom_provider, register_credential, model_entry)
+from tianji.pool import pool_create
 
 
 # ==================================================================
@@ -996,3 +1007,346 @@ class TestEdgeCases:
                 "messages": [{"role": "user", "content": "hi"}]}
         out, _ = convert.convert_request(body, "openai_chat", "anthropic")
         assert out["max_tokens"] == 100
+
+
+# ==================================================================
+# 端到端: 转换层接入 proxy 请求路径(task-04)
+# ==================================================================
+
+def _t58_provider(conn, ident, name, base_url, protocol, request_id):
+    register_custom_provider(
+        conn, ident, name, base_url=base_url, protocol=protocol,
+        auth_style="bearer", request_id=request_id)
+    entry = ops._config(conn, "integration_provider:" + name)
+    if isinstance(entry, str):
+        entry = json.loads(entry)
+    entry["models"] = [model_entry({"id": "test-model"})]
+    conn.execute(
+        "UPDATE configs SET value=? WHERE key=?",
+        (json.dumps(entry, ensure_ascii=False),
+         "integration_provider:" + name))
+
+
+def _t58_credential(conn, ident, name, provider, tmp_path, request_id):
+    key_ref = str(tmp_path / (name + ".key"))
+    Path(key_ref).write_text("upstream-key-58", encoding="utf-8")
+    register_credential(conn, ident, name, provider,
+                        key_ref=key_ref, request_id=request_id)
+
+
+def _t58_token(conn, pool_name):
+    row = conn.execute(
+        "SELECT value FROM configs WHERE key=?",
+        ("pool:token:" + pool_name,)).fetchone()
+    assert row, "池令牌应已生成"
+    return row["value"]
+
+
+def _t58_start(cls):
+    backend = HTTPServer(("127.0.0.1", 0), cls)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    return backend, backend.server_address[1]
+
+
+def _t58_proxy(port):
+    pt = threading.Thread(target=run_proxy, args=(port,), daemon=True)
+    pt.start()
+    time.sleep(0.3)
+    return pt
+
+
+_ANTH_ACCEPT = "application/vnd.anthropic+json"
+
+
+def _t58_post(pool_name, port, token, body_dict, accept="application/json"):
+    url = (f"http://127.0.0.1:{port}/proxy/{pool_name}"
+           f"/v1/chat/completions?token={token}")
+    req = urllib.request.Request(
+        url, data=json.dumps(body_dict).encode(),
+        headers={"Content-Type": "application/json", "Accept": accept},
+        method="POST")
+    return urllib.request.urlopen(req, timeout=10)
+
+
+def _t58_log_row(conn, pool_name):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        rows = conn.execute(
+            "SELECT * FROM pool_request_logs WHERE pool_name=?",
+            (pool_name,)).fetchall()
+        if rows:
+            return rows[0]
+        time.sleep(0.1)
+    return None
+
+
+class _OaiBackend(BaseHTTPRequestHandler):
+    """openai_chat 后端: 捕获请求体,回 openai 形态补全。"""
+    captured = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        type(self).captured.append(
+            json.loads(self.rfile.read(length) or b"{}"))
+        body = json.dumps({
+            "id": "chatcmpl-t58", "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{"index": 0, "message": {
+                "role": "assistant", "content": "Hello from oai"},
+                "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3,
+                      "total_tokens": 8},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+class _OaiSSEBackend(BaseHTTPRequestHandler):
+    """openai_chat SSE 后端: 两块 chunk + [DONE]。"""
+    captured = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        type(self).captured.append(
+            json.loads(self.rfile.read(length) or b"{}"))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        chunks = [
+            {"id": "c-t58", "object": "chat.completion.chunk",
+             "choices": [{"index": 0,
+                          "delta": {"role": "assistant",
+                                    "content": "Hello"},
+                          "finish_reason": None}]},
+            {"id": "c-t58", "object": "chat.completion.chunk",
+             "choices": [{"index": 0, "finish_reason": "stop"}],
+             "usage": {"prompt_tokens": 5, "completion_tokens": 2}},
+        ]
+        for c in chunks:
+            self.wfile.write(
+                ("data: " + json.dumps(c) + "\n\n").encode())
+            self.wfile.flush()
+            time.sleep(0.05)
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        self.close_connection = True
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+class _AnthBackend(BaseHTTPRequestHandler):
+    """anthropic 后端: 捕获请求体,回 anthropic 形态 message。"""
+    captured = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        type(self).captured.append(
+            json.loads(self.rfile.read(length) or b"{}"))
+        body = json.dumps({
+            "id": "msg_t58", "type": "message", "role": "assistant",
+            "model": "test-model",
+            "content": [{"type": "text", "text": "Hello from anth"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 7, "output_tokens": 4},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+@pytest.mark.timeout(30)
+class TestConversionE2E:
+    """验收 1/2/3: 跨协议端到端 / 同协议优先回归 / responses 组合拒绝。"""
+
+    def test_cross_protocol_nonstream_e2e(self, conn, controller, tmp_path):
+        """anthropic 请求 → 池中仅 openai_chat 成员 → 请求转换后路由,
+        响应转回 anthropic 形态。"""
+        _OaiBackend.captured = []
+        backend, bport = _t58_start(_OaiBackend)
+        pt = None
+        try:
+            _t58_provider(conn, controller, "t58-prov-oai",
+                          f"http://127.0.0.1:{bport}", "openai_chat",
+                          "t58-p1")
+            _t58_credential(conn, controller, "t58-cred-oai",
+                            "t58-prov-oai", tmp_path, "t58-c1")
+            pool_create(conn, controller, "t58-x-pool",
+                        members=["t58-cred-oai"], request_id="t58-pool1")
+            token = _t58_token(conn, "t58-x-pool")
+            pt = _t58_proxy(19070)
+
+            resp = _t58_post(
+                "t58-x-pool", 19070, token,
+                {"model": "test-model", "max_tokens": 50,
+                 "system": "Be nice",
+                 "messages": [{"role": "user", "content": "hi"}]},
+                accept=_ANTH_ACCEPT)
+            assert resp.status == 200
+            out = json.loads(resp.read())
+            # 响应已转回 anthropic 形态
+            assert out["type"] == "message"
+            assert out["role"] == "assistant"
+            assert out["content"] == [
+                {"type": "text", "text": "Hello from oai"}]
+            assert out["stop_reason"] == "end_turn"
+            assert out["usage"]["input_tokens"] == 5
+
+            # 上游收到的是转换后的 openai_chat 请求
+            assert _OaiBackend.captured, "上游应收到请求"
+            upstream = _OaiBackend.captured[0]
+            assert "system" not in upstream, (
+                "anthropic 顶层 system 应被转换为 system 消息")
+            assert upstream["messages"][0] == {
+                "role": "system", "content": "Be nice"}
+            assert upstream["messages"][1] == {
+                "role": "user", "content": "hi"}
+
+            row = _t58_log_row(conn, "t58-x-pool")
+            assert row is not None
+            assert row["is_converted"] == 1
+            assert row["member_name"] == "t58-cred-oai"
+        finally:
+            if pt:
+                pt.join(timeout=2)
+            backend.shutdown()
+
+    def test_cross_protocol_sse_e2e(self, conn, controller, tmp_path):
+        """跨协议流式: openai_chat SSE 上游 → anthropic SSE 事件流回客户端。"""
+        _OaiSSEBackend.captured = []
+        backend, bport = _t58_start(_OaiSSEBackend)
+        pt = None
+        try:
+            _t58_provider(conn, controller, "t58s-prov-oai",
+                          f"http://127.0.0.1:{bport}", "openai_chat",
+                          "t58s-p1")
+            _t58_credential(conn, controller, "t58s-cred-oai",
+                            "t58s-prov-oai", tmp_path, "t58s-c1")
+            pool_create(conn, controller, "t58-sse-pool",
+                        members=["t58s-cred-oai"], request_id="t58s-pool")
+            token = _t58_token(conn, "t58-sse-pool")
+            pt = _t58_proxy(19072)
+
+            resp = _t58_post(
+                "t58-sse-pool", 19072, token,
+                {"model": "test-model", "max_tokens": 50,
+                 "stream": True,
+                 "messages": [{"role": "user", "content": "hi"}]},
+                accept=_ANTH_ACCEPT)
+            assert resp.status == 200
+            raw = resp.read()
+            # 流式响应已转换为 anthropic SSE 事件形态
+            assert b"event: message_start" in raw
+            assert b"text_delta" in raw
+            assert b'"text":"Hello"' in raw
+            assert b"event: message_stop" in raw
+
+            # 上游收到转换后的 openai_chat 请求
+            assert _OaiSSEBackend.captured
+            assert _OaiSSEBackend.captured[0]["messages"][0]["role"] == "user"
+
+            row = _t58_log_row(conn, "t58-sse-pool")
+            assert row is not None
+            assert row["is_converted"] == 1
+            assert row["is_stream"] == 1
+        finally:
+            if pt:
+                pt.join(timeout=2)
+            backend.shutdown()
+
+    def test_same_protocol_preferred_no_conversion(
+            self, conn, controller, tmp_path):
+        """同协议优先回归: 两协议成员同时在池 → 同协议成员被选中,不走转换。"""
+        _AnthBackend.captured = []
+        _OaiBackend.captured = []
+        b_anth, port_anth = _t58_start(_AnthBackend)
+        b_oai, port_oai = _t58_start(_OaiBackend)
+        pt = None
+        try:
+            _t58_provider(conn, controller, "t58p-prov-anth",
+                          f"http://127.0.0.1:{port_anth}", "anthropic",
+                          "t58p-pa")
+            _t58_provider(conn, controller, "t58p-prov-oai",
+                          f"http://127.0.0.1:{port_oai}", "openai_chat",
+                          "t58p-pb")
+            _t58_credential(conn, controller, "t58p-cred-anth",
+                            "t58p-prov-anth", tmp_path, "t58p-ca")
+            _t58_credential(conn, controller, "t58p-cred-oai",
+                            "t58p-prov-oai", tmp_path, "t58p-cb")
+            pool_create(conn, controller, "t58-prio-pool",
+                        members=["t58p-cred-anth", "t58p-cred-oai"],
+                        request_id="t58p-pool")
+            token = _t58_token(conn, "t58-prio-pool")
+            pt = _t58_proxy(19074)
+
+            resp = _t58_post(
+                "t58-prio-pool", 19074, token,
+                {"model": "test-model", "max_tokens": 50,
+                 "system": "Be nice",
+                 "messages": [{"role": "user", "content": "hi"}]},
+                accept=_ANTH_ACCEPT)
+            assert resp.status == 200
+            out = json.loads(resp.read())
+            # 同协议透传: 响应原样(anthropic 形态)
+            assert out["type"] == "message"
+            assert out["content"] == [
+                {"type": "text", "text": "Hello from anth"}]
+
+            # anthropic 成员被选中;openai 成员零调用
+            assert _AnthBackend.captured, "anthropic 成员应被选中"
+            assert not _OaiBackend.captured, "同协议优先,openai 成员不应被调用"
+            # 请求体原样透传(未转换): 顶层 system 仍在
+            assert _AnthBackend.captured[0].get("system") == "Be nice"
+
+            row = _t58_log_row(conn, "t58-prio-pool")
+            assert row is not None
+            assert row["member_name"] == "t58p-cred-anth"
+            assert row["is_converted"] == 0
+        finally:
+            if pt:
+                pt.join(timeout=2)
+            b_anth.shutdown()
+            b_oai.shutdown()
+
+    def test_responses_protocol_rejected_fail_loud(
+            self, conn, controller, tmp_path):
+        """不可转换组合: anthropic 请求 + 池中仅 openai_responses 成员
+        → fail-loud 503 no_available_member(不静默坏掉)。"""
+        backend, bport = _t58_start(_OaiBackend)
+        pt = None
+        try:
+            _t58_provider(conn, controller, "t58r-prov-resp",
+                          f"http://127.0.0.1:{bport}", "openai_responses",
+                          "t58r-p1")
+            _t58_credential(conn, controller, "t58r-cred-resp",
+                            "t58r-prov-resp", tmp_path, "t58r-c1")
+            pool_create(conn, controller, "t58-resp-pool",
+                        members=["t58r-cred-resp"], request_id="t58r-pool")
+            token = _t58_token(conn, "t58-resp-pool")
+            pt = _t58_proxy(19076)
+
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                _t58_post(
+                    "t58-resp-pool", 19076, token,
+                    {"model": "test-model", "max_tokens": 50,
+                     "messages": [{"role": "user", "content": "hi"}]},
+                    accept=_ANTH_ACCEPT)
+            assert exc_info.value.code == 503
+            payload = json.loads(exc_info.value.read())
+            assert payload["error"] == "no_available_member"
+        finally:
+            if pt:
+                pt.join(timeout=2)
+            backend.shutdown()

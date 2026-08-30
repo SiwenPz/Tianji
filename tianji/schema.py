@@ -229,6 +229,8 @@ CREATE TABLE IF NOT EXISTS pool_member_health (
   last_success_at INTEGER NOT NULL DEFAULT 0,
   last_failure_at INTEGER NOT NULL DEFAULT 0,
   last_error TEXT NOT NULL DEFAULT '',
+  circuit_state TEXT NOT NULL DEFAULT '',
+  circuit_state_changed_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (pool_name, member_name)
 );
 """

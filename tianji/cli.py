@@ -59,7 +59,14 @@ def _out(d):
     print(json.dumps(d, ensure_ascii=False, indent=2))
 
 
-# ---------------------------------------------------------------- task
+@app.command("nudge")
+def root_nudge(dispatch_id: int, reason: str = "",
+               request_id: str = typer.Option(None, "--request-id")):
+    """7.5 总控续推:薄委托 dispatch_nudge。"""
+    _out(ops.dispatch_nudge(_conn(), _ident(), dispatch_id, reason, request_id))
+
+
+# ------------------------------------------------------------------ task
 
 @task_app.command("new")
 def task_new(title: str, description: str = "", priority: int = 0,
@@ -73,6 +80,12 @@ def task_new(title: str, description: str = "", priority: int = 0,
 @task_app.command("list")
 def task_list(status: str = None):
     _out({"tasks": ops.task_list(_conn(), status)})
+
+
+@task_app.command("next")
+def task_next():
+    """取单: 展示下一个应派任务(10.3,只读;推荐人选由派单时分配器定,此处不出)。"""
+    _out(ops.task_queue_next(_conn()))
 
 
 @task_app.command("show")
@@ -106,18 +119,22 @@ def task_force(task_id: int, to: str, reason: str,
                new_worker: str = typer.Option(None, "--new-worker"),
                request_id: str = typer.Option(None, "--request-id")):
     """强制干预(4.4): 既定动作(终止/改派/接管)总控直接执行;兜底跳转创建人审请求(HITL)。"""
+    _out(ops.task_force(_conn(), _ident(), task_id, to, reason,
+                        request_id, new_worker))
 
 
 @task_app.command("approve-force")
 def task_approve_force(approval_id: int):
     """人审通过兜底跳转请求(HITL): 用户显式批准后迁移才生效。"""
-    _out(ops.force_approve(_conn(), "cli-user", approval_id))
+    ident = _ident()
+    _out(ops.force_approve(_conn(), ident["worker_id"], approval_id))
 
 
 @task_app.command("reject-force")
 def task_reject_force(approval_id: int):
     """人审驳回兜底跳转请求(HITL): 拒绝后迁移不生效。"""
-    _out(ops.force_reject(_conn(), "cli-user", approval_id))
+    ident = _ident()
+    _out(ops.force_reject(_conn(), ident["worker_id"], approval_id))
 
 
 @task_app.command("cancel-force")
@@ -273,7 +290,7 @@ def instance_register(name: str, shell: str, model: str,
 def instance_unbind(name: str,
                     request_id: str = typer.Option(None, "--request-id")):
     """换绑/下线(旧 secret 自然作废)。"""
-    _out(ops.instance_unbind(_conn(), name, request_id))
+    _out(ops.instance_unbind(_conn(), _ident(), name, request_id))
 
 
 @instance_app.command("delete")
@@ -971,7 +988,7 @@ def daemon_start(interval: int = typer.Option(30, "--interval",
                  web_port: int = typer.Option(daemon.WEB_PORT_DEFAULT,
                                               "--web-port",
                                               help="驾驶舱 Web 起始端口(冲突顺延+1)")):
-    """拉起 daemon supervisor + 监控器 + 驾驶舱 Web 两常驻(18.2/18.3)。"""
+    """拉起 daemon supervisor + 监控器 + 驾驶舱 Web 三常驻(18.2/18.3)。"""
     _out(daemon.daemon_start(interval, web_port))
 
 

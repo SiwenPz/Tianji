@@ -39,7 +39,7 @@ description: 新壳接入检查单。八问问完才入库,三关自测全绿才
 3. **数据根重定向**: 有没有整体重定向数据根的环境变量(如 KIMI_CODE_HOME)?
    有则总控实例隔离靠它;没有就如实记,登录态/配置与用户全局共享。
 4. **key 注入方式**: 无头模式下 key 怎么进进程(env 家族名/配置文件)?
-   对应 `_KEY_ENV_MAPPERS` 里哪个 style;现有 style 都不适用就新增一行
+   对应 `_build_provider_env` 里哪个 style;现有 style 都不适用就新增一行
    mapper(这是唯一允许加代码的地方,backend class 不许动)。
 
 > 口径: 协议 backend 写一次,壳条目声明差异。第三个 ACP 壳接进来=

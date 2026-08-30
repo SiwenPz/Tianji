@@ -153,3 +153,81 @@ def test_legacy_only_ledger_falls_back_to_key_entry(conn, controller):
         conn, "老key")
     assert cred is None and prov is None
     assert base_url == "https://old.example/v1" and key_ref == "old.txt"
+
+
+# ---------------------------------------------------------------------------
+# pool 渲染: base_url 带 /proxy/<池名> 路径 + token 注入(票 59)
+# ---------------------------------------------------------------------------
+
+def test_pool_claude_render_base_url_and_token(conn, controller, tmp_path):
+    """池绑定 claude 实例: base_url 含 /proxy/<pool> 路径,token 进 settings。"""
+    from tianji import pool as pool_mod
+    r = pool_mod.pool_create(conn, controller, "tp01", members=[],
+                              request_id="sr-pool1")
+    pool_token = r["token"]
+    ops.config_set(conn, controller, "daemon.proxy_port", "9876",
+                   request_id="sr-port")
+    iso = tmp_path / "tp01-iso"
+    cmd, arts = shellrender.render(conn, "claude", instance="c1",
+                                   model="test-model", key_name="tp01",
+                                   isolated_dir=str(iso))
+    assert "settings" in cmd
+    settings = json.loads(Path(arts[0]).read_text(encoding="utf-8"))
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9876/proxy/tp01"
+    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == pool_token
+
+
+def test_pool_codex_render_base_url_and_token(conn, controller, tmp_path):
+    """池绑定 codex 实例: base_url 含 /proxy/<pool>, key 不落 config.toml。"""
+    from tianji import pool as pool_mod
+    pool_mod.pool_create(conn, controller, "tp02", members=[],
+                         request_id="sr-pool2")
+    ops.config_set(conn, controller, "daemon.proxy_port", "9877",
+                   request_id="sr-port2")
+    iso = tmp_path / "tp02-iso"
+    cmd, arts = shellrender.render(conn, "codex", instance="x1",
+                                   model="test-model", key_name="tp02",
+                                   isolated_dir=str(iso))
+    cfg = (iso / "config.toml").read_text(encoding="utf-8")
+    assert 'base_url = "http://127.0.0.1:9877/proxy/tp02"' in cfg
+    tok = shellrender._pool_token(conn, "tp02")
+    assert tok not in cfg
+
+
+def test_pool_config_binding_render_base_url(conn, controller, tmp_path):
+    """池绑定 config_binding 壳: base_url 含 /proxy/<pool>,token 进 env。"""
+    from tianji import pool as pool_mod
+    pool_mod.pool_create(conn, controller, "tp03", members=[],
+                         request_id="sr-pool3")
+    ops.config_set(conn, controller, "daemon.proxy_port", "9878",
+                   request_id="sr-port3")
+    ops.config_set(conn, controller, "shell:kimi",
+                   json.dumps({**wizard.SHELL_ENTRY_DEFAULTS["kimi"],
+                               "provider_env": {
+                                   "map": {
+                                       "$OPENAI_BASE_URL": "{base_url}",
+                                       "TIANJI_WIZARD_KEY": "{key}"
+                                   }
+                               }}, ensure_ascii=False),
+                   request_id="sr-kimi")
+    iso = tmp_path / "tp03-iso"
+    cmd, arts = shellrender.render(conn, "kimi", instance="k1",
+                                   model="test-model", key_name="tp03",
+                                   isolated_dir=str(iso))
+    pool_token = shellrender._pool_token(conn, "tp03")
+    assert f"http://127.0.0.1:9878/proxy/tp03" in cmd
+    assert pool_token in cmd
+
+
+def test_pool_render_no_proxy_port_falls_back(conn, controller, tmp_path):
+    """无 proxy 端口时池渲染: base_url 空,token 仍注入。"""
+    from tianji import pool as pool_mod
+    pool_mod.pool_create(conn, controller, "tp04", members=[],
+                         request_id="sr-pool4")
+    iso = tmp_path / "tp04-iso"
+    cmd, arts = shellrender.render(conn, "claude", instance="c4",
+                                   model="test-model", key_name="tp04",
+                                   isolated_dir=str(iso))
+    settings = json.loads(Path(arts[0]).read_text(encoding="utf-8"))
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == ""
+    assert settings["env"]["ANTHROPIC_AUTH_TOKEN"] == shellrender._pool_token(conn, "tp04")

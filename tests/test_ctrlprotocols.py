@@ -568,6 +568,13 @@ class TestProviderEnv:
         assert ctrlprotocols._build_provider_env(
             {"target": "process_env", "map": {"X": "{key}"}}, "") == {}
 
+    def test_missing_key_file_fails_loud(self, acp_home, tmp_path):
+        """key_ref 指了路径但文件不存在 → fail-loud 报错指路,不许静默空串。"""
+        prov = {"target": "process_env", "map": {"K": "{key}"}}
+        missing = str(tmp_path / "no-such.key")
+        with pytest.raises(FileNotFoundError, match="no-such.key"):
+            ctrlprotocols._build_provider_env(prov, missing)
+
     def test_settings_env_target_empty(self, acp_home):
         """target=settings_env 不注入进程 env(settings 文件已写好)。"""
         prov = {"target": "settings_env", "map": {"X": "{key}"}}

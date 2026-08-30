@@ -91,11 +91,19 @@ def resolve_credential(conn, key_name):
 
 
 def _read_key(key_ref: str) -> str:
-    """key 本体从受保护引用文件现读;引用缺失/文件不在=空串如实降级。"""
+    """key 本体从受保护引用文件现读(附录 E.4)。
+
+    空 key_ref=免 key 放行,返回空串;引用给了但文件读不到=fail-loud
+    抛 FileNotFoundError 指路,不静默省略(静默省略会让壳拿着空 key 启动,
+    故障现场离真实原因十万八千里)。
+    """
     if not key_ref:
         return ""
     p = Path(key_ref)
-    return p.read_text(encoding="utf-8").strip() if p.is_file() else ""
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"key 引用文件不存在: {key_ref}(先落盘凭据文件或修正 key_ref 指向)")
+    return p.read_text(encoding="utf-8").strip()
 
 
 def _pool_token(conn, name: str) -> str:
@@ -106,13 +114,18 @@ def _pool_token(conn, name: str) -> str:
     return row["value"] if row else ""
 
 
-def _pool_proxy_url(conn) -> str:
-    """Proxy base_url from daemon config."""
+def _pool_proxy_url(conn, pool_name: str = "") -> str:
+    """Proxy base_url from daemon config, with optional /proxy/<pool_name> path."""
     row = conn.execute(
         "SELECT value FROM configs WHERE key=?", ("daemon.proxy_port",)
     ).fetchone()
     port = (row["value"] if row else "").strip()
-    return f"http://127.0.0.1:{port}" if port else ""
+    if not port:
+        return ""
+    url = f"http://127.0.0.1:{port}"
+    if pool_name:
+        url = f"{url}/proxy/{pool_name}"
+    return url
 
 
 # ---------------------------------------------------------------- renderers
@@ -203,6 +216,17 @@ def _render_config_binding(ctx):
     env_name = entry.get("worker_data_root_env") or ""
     cmd = ctx["shell"]
 
+    # thinking patch 接线(票 26,dsh 形态): 实例设了思考级别且壳模板声明
+    # --patch 机制时,把 render._apply_thinking_level 写入隔离目录的
+    # thinking.patch.yml 接进 launch_cmd(路径与其写入处逐字对齐)。
+    _ZH2EN = {"低": "low", "中": "medium", "高": "high"}
+    level = ctx.get("thinking_level") or ""
+    tmap = entry.get("thinking_level_map") or {}
+    rule = tmap.get(_ZH2EN.get(level, "")) or {}
+    if rule.get("param") == "--patch" and ctx.get("isolated_dir"):
+        patch = Path(ctx["isolated_dir"]) / "thinking.patch.yml"
+        cmd = f'{cmd} --patch "{patch}"'
+
     # provider_env.process_env: 按 entry 内 map 模板注入 env(数据驱动)
     prov_env = (entry.get("provider_env") or {}).get("map") or {}
     key_txt = _read_key(ctx.get("key_ref", ""))
@@ -231,7 +255,7 @@ def _render_config_binding(ctx):
     return cmd, _arts
 
 def render(conn, shell, instance="", model="", key_name="", isolated_dir="",
-           entry=None):
+           entry=None, thinking_level=""):
     """通用装配控制流: 壳名→morph→renderer→(launch_cmd, artifacts)。零壳名分支。"""
     morph = _shell_to_morph(shell, conn=conn)
     if morph is None:
@@ -253,7 +277,7 @@ def render(conn, shell, instance="", model="", key_name="", isolated_dir="",
                 tf = iso / "pool-token.key"
                 tf.write_text(token, encoding="utf-8")
                 key_ref = str(tf)
-                base_url = _pool_proxy_url(conn) or base_url
+                base_url = _pool_proxy_url(conn, key_name) or base_url
     if entry is None:
         row = conn.execute("SELECT value FROM configs WHERE key=?",
                            (f"integration_shell:{shell}",)).fetchone()
@@ -265,7 +289,8 @@ def render(conn, shell, instance="", model="", key_name="", isolated_dir="",
             entry = json.loads(row["value"]) if row else {}
     return fn({"instance": instance, "shell": shell, "model": model,
                "key_name": key_name, "isolated_dir": isolated_dir,
-               "entry": entry, "key_ref": key_ref, "base_url": base_url})
+               "entry": entry, "key_ref": key_ref, "base_url": base_url,
+               "thinking_level": thinking_level})
 
 
 def rerender_instance(conn, name):
@@ -274,10 +299,11 @@ def rerender_instance(conn, name):
     只查表渲染,不触发任何缺失配置补建;注册表缺条目时如实报错。
     """
     inst = conn.execute(
-        "SELECT name, shell, model, key_name, isolated_dir FROM instances"
+        "SELECT name, shell, model, key_name, isolated_dir, thinking_level FROM instances"
         " WHERE name=? AND is_active=1", (name,)).fetchone()
     if inst is None:
         raise ValueError(f"实例 {name} 未注册或不活跃")
     return render(conn, inst["shell"], instance=inst["name"],
                   model=inst["model"], key_name=inst["key_name"] or "",
-                  isolated_dir=inst["isolated_dir"] or "")
+                  isolated_dir=inst["isolated_dir"] or "",
+                  thinking_level=inst["thinking_level"] if "thinking_level" in inst.keys() else "")

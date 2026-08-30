@@ -605,18 +605,23 @@ def _build_provider_env(provider_env: dict, key_ref: str,
     pmap = provider_env.get("map")
     if not pmap:
         return {}
-    try:
-        key_value = Path(key_ref).read_text(encoding="utf-8").strip() if key_ref else ""
-    except OSError:
+    # fail-loud(票: key 占位符): key_ref 指了路径但读不到 = 配置错误,
+    # 必须显式报错指路,不许静默空串(空 key 注入 env 会让 401 排障无从下手);
+    # 空 key_ref(未配置 key)保持返回 "" 由模板自行兜底。
+    if not key_ref:
         key_value = ""
+    else:
+        try:
+            key_value = Path(key_ref).read_text(encoding="utf-8").strip()
+        except OSError as e:
+            raise FileNotFoundError(
+                f"key_ref 指向的 key 文件读不到: {key_ref}({e});"
+                f"请检查 instance 的 key_ref 配置或重建该文件") from e
     ctx = {"key": key_value, "model": model, "base_url": base_url,
            "protocol": protocol}
     env = {}
     for var_name, tpl in pmap.items():
-        try:
-            val = tpl.format(**ctx)
-        except (KeyError, ValueError):
-            val = ""
+        val = tpl.format(**ctx)
         if val:
             env[var_name] = val
     return env

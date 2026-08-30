@@ -2,7 +2,9 @@
 
 import json
 import os
+import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 from tianji import daemon, ops
 from tianji.db import connect
@@ -87,3 +89,24 @@ def test_backup_audit_and_data_equal(tianji_home):
         assert v is not None and v[0] == "v"
     finally:
         c.close()
+
+
+def test_backup_failure_in_monitor_writes_audit_and_does_not_crash(tianji_home, monkeypatch):
+    """监控器 daily backup 失败写 backup_failed audit 行,不崩溃(18.5)。"""
+    _write_ledger(tianji_home)
+    conn = connect()
+    ops.ensure_defaults(conn)
+    from tianji import monitor as monitor_mod
+    import tianji.daemon as daemon_mod
+    monkeypatch.setattr(daemon_mod, "backup_ledger",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            OSError("disk full")))
+    # 不崩: 异常被吞,返回 None
+    assert monitor_mod._monitor_backup_once(conn) is None
+    row = conn.execute(
+        "SELECT detail FROM audit WHERE action='backup_failed'"
+    ).fetchone()
+    assert row is not None
+    detail = json.loads(row["detail"])
+    assert detail.get("error") == "disk full"
+    conn.close()

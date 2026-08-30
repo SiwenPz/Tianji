@@ -299,6 +299,7 @@ DEFAULTS = {
     "pool_proxy.circuit_min_samples": "15",       # 熔断最少样本数
     "pool_proxy.circuit_open_seconds": "90",      # 熔断开窗秒数
     "pool_proxy.circuit_half_open_need": "3",     # 半开探测需连续成功数
+    "pool_log_retention_days": "30",              # 池请求日志保留天数(task-09)
     # 组合红黑榜(9.5,票 25): 出厂注册的视图类插件(票 23 接口,可关)
     "plugin:红黑榜": json.dumps({
         "name": "红黑榜", "type": "view", "version": "v1",
@@ -516,7 +517,7 @@ def _config(conn, key: str) -> str:
 
 
 def _issue_locked(conn, task_id, worker_id, role, expect_min,
-                  reason="", axis="", overrides=None):
+                  reason="", axis="", overrides=None, breakpoint_summary=None):
     """派单创建(事务内): 写派单行+dispatch 消息。
 
     secret 由 spawn 时生成注入(11.4 launcher 一次性注入),派单 dcap_hash 此刻留空。
@@ -638,6 +639,8 @@ def _issue_locked(conn, task_id, worker_id, role, expect_min,
         "axis": axis, "worktree_path": worktree_path,
         "worktree_base": worktree_base,
     }
+    if breakpoint_summary:
+        payload["breakpoint_summary"] = breakpoint_summary
     # 票 26: 显示模式/思考级别单点覆盖(不改实例默认,15.8/13.3)
     for k in ("display_mode", "thinking_level"):
         if overrides and overrides.get(k):
@@ -833,7 +836,7 @@ def _last_worker_by_role(conn, task_id, role="worker"):
     return row["worker_id"] if row else None
 
 
-def _reschedule(conn, task_id, worker_id, reason, skip_score=False):
+def _reschedule(conn, task_id, worker_id, reason, skip_score=False, breakpoint_summary=None):
     """驳回=重派(4.3): 计数+1,超限终止;否则回 dispatched 并自动发新派单。
 
     审核驳回(mechanical_fail/review_reject)、进程退出无结算重派、用户驳回均计入(12.1)。
@@ -901,7 +904,8 @@ def _reschedule(conn, task_id, worker_id, reason, skip_score=False):
               {"dispatch_id": sr["id"], "task_id": task_id,
                "reason": f"reschedule_obsolete: {reason}"})
     _issue_locked(conn, task_id, target_worker, "worker",
-                  _get_expect_min(conn, task_id, target_worker), reason=reason)
+                  _get_expect_min(conn, task_id, target_worker), reason=reason,
+                  breakpoint_summary=breakpoint_summary)
     return {"task_id": task_id, "status": "dispatched", "retry_count": new_count}
 
 
@@ -1383,7 +1387,8 @@ def _execute_force(conn, ident, task_id, to_state, reason, request_id,
                       {"task_id": task_id,
                        "reason": f"强制终止: {t['status']}→archived({reason})"},
                       "controller")
-        return {"task_id": task_id, "from": t["status"], "to": "archived"}
+        return {"task_id": task_id, "from": t["status"], "to": "archived",
+                "status": "success"}
 
     if to_state == "dispatched":
         # 改派/接管: 原派单 cancelled + 关登记行 + 任务回 dispatched
@@ -1414,7 +1419,8 @@ def _execute_force(conn, ident, task_id, to_state, reason, request_id,
                       {"task_id": task_id,
                        "reason": f"强制改派: {t['status']}→dispatched({reason})"},
                       "controller")
-        return {"task_id": task_id, "from": t["status"], "to": "dispatched"}
+        return {"task_id": task_id, "from": t["status"], "to": "dispatched",
+                "status": "success"}
 
     # 兜底(不应到达: task_force 已拦截)
     raise ValueError(f"非法直接执行目标: {to_state}")
@@ -1471,8 +1477,7 @@ def _create_force_approval(c, conn, ident, task_id, from_state, to_state,
     return {"approval_id": approval_id, "task_id": task_id,
             "from": from_state, "to": to_state, "reason": reason,
             "status": "pending",
-            "note": "等待用户审批(HITL): tianji task approve-force "
-                    f"{approval_id}"}
+            "message": f"已落待审批,需用户批准: tianji task approve-force {approval_id}"}
 
 
 FORCE_APPROVAL_TIMEOUT = 86400  # 24 小时超时
@@ -1506,6 +1511,24 @@ def force_approve(conn, approver, approval_id):
                 raise KeyError(f"审批请求 {approval_id} 不存在")
             if r["status"] != "pending":
                 return {"approval_id": approval_id, "already": r["status"]}
+
+            # 24h 超时校验(双保险: 即使 monitor 不在跑也拦截)
+            if isinstance(r["created_at"], (int, float)):
+                if (now() - r["created_at"]) > FORCE_APPROVAL_TIMEOUT:
+                    c.execute(
+                        "UPDATE force_approvals SET status='expired', decided_by=?, "
+                        "decided_at=? WHERE id=?",
+                        (approver, now(), approval_id))
+                    audit(conn, "force_approval_timeout",
+                          {"approval_id": approval_id, "task_id": r["task_id"],
+                           "created_at": r["created_at"],
+                           "by": approver})
+                    return {"approval_id": approval_id, "task_id": r["task_id"],
+                            "decision": "expired", "reason": "超时未批(24h)"}
+
+            if approver == r["initiator_id"]:
+                raise PermissionError(
+                    "禁止自批: 审批人与发起人相同")
 
             task_id = r["task_id"]
             to_state = r["to_state"]
@@ -1589,6 +1612,10 @@ def force_reject(conn, approver, approval_id):
                 raise KeyError(f"审批请求 {approval_id} 不存在")
             if r["status"] != "pending":
                 return {"approval_id": approval_id, "already": r["status"]}
+
+            if approver == r["initiator_id"]:
+                raise PermissionError(
+                    "禁止自批: 审批人与发起人相同")
             c.execute(
                 "UPDATE force_approvals SET status='rejected', decided_by=?, "
                 "decided_at=? WHERE id=?",
@@ -1698,7 +1725,16 @@ def mechanical_verify(conn, task_id, timeout=120):
               {"task_id": task_id, "dispatch_id": did, "ok": ok,
                "output": output, "cmd": t["verify_cmd"], "scope": scope})
         if not ok:
-            _reschedule(c, task_id, _last_worker_by_role(c, task_id, "worker"),
+            wid = _last_worker_by_role(c, task_id, "worker")
+            dm = c.execute("SELECT expect_min FROM dispatches WHERE task_id=? "
+                           "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+            em = dm["expect_min"] if dm else 30
+            # 画像行缺失不炸机械验收事务(对齐 monitor 进程退出扣分口径)
+            try:
+                update_score(c, wid, "mechanical_fail", em)
+            except KeyError:
+                pass
+            _reschedule(c, task_id, wid,
                         f"mechanical_fail: {fail_reason}")
             return {"task_id": task_id, "ok": False, "rescheduled": True}
         result = {"task_id": task_id, "ok": True}
@@ -1803,8 +1839,12 @@ def instance_register(conn, name, shell, model, isolated_dir="", launch_cmd="",
                 "note": "secret 明文仅本次输出,启动器注入 env 用"}
 
 
-def instance_unbind(conn, name, request_id=None):
-    """换绑/下线(10.1 旧 secret 自然作废): is_active=0+instance_unbind 消息。"""
+def instance_unbind(conn, ident, name, request_id=None):
+    """换绑/下线(10.1 旧 secret 自然作废): is_active=0+instance_unbind 消息。
+    仅总控身份可执行(14.3 回收需总控确认)。
+    """
+    if not auth.check_controller(conn, ident):
+        raise PermissionError("instance_unbind 仅总控身份可执行")
     with tx(conn) as c:
         def _do():
             row = c.execute("SELECT name FROM instances WHERE name=?", (name,)).fetchone()
@@ -2273,7 +2313,8 @@ def update_score(conn, instance_name: str, event: str,
                  expect_min: int, actual_minutes: int | None = None) -> float:
     """表现分更新(9.4): 近 10 单加权移动平均,从简实现。
 
-    event: on_time / overtime / progress_exceed / review_reject / process_dead
+    event: on_time / overtime / progress_exceed / review_reject / mechanical_fail
+           / process_dead
     """
     profile = conn.execute(
         "SELECT score, score_history FROM ability_profiles WHERE instance_name=?",
@@ -2290,6 +2331,9 @@ def update_score(conn, instance_name: str, event: str,
     elif event == "progress_exceed":
         delta = -8
     elif event == "review_reject":
+        delta = -15
+    elif event == "mechanical_fail":
+        # 机械验收驳回(8.3): 与审核驳回同档(9.4)
         delta = -15
     elif event == "process_dead":
         delta = -10

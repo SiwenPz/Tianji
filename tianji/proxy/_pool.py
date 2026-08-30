@@ -4,6 +4,7 @@
 核心纯标准库(urllib/http.client),无新依赖。
 
 路由协议: POST /proxy/<pool_name>/<api_path>?token=<池令牌>
+  令牌亦支持 Authorization: Bearer / x-api-key 头(task-03 认证头兼容)。
   请求体含 model 字段 → 按模型+协议过滤候选 → 纯轮盘选成员 → 转发。
 """
 
@@ -26,7 +27,8 @@ from typing import Any
 
 from .. import integrations, ops
 from ..db import connect, now
-from .convert import is_conversion_needed
+from .convert import convert_request, convert_response, is_conversion_needed
+from .stream import stream_convert
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +228,9 @@ class PoolRouter:
                    "members": {m: cb.to_dict() for m, cb in self._breakers.items()}})
 
     def pick(self, pool_name, model, protocol):
-        """选下一跳成员。返回 (member_name, cred_dict, provider_dict) 或 (None, None, None)。"""
+        """选下一跳成员。返回 (member_name, cred_dict, provider_dict) 或 (None, None, None)。
+        两段式: 先同协议透传优先,无可用成员时按可转换协议(anthropic↔openai_chat)兜底。
+        """
         pool = _pool_json(self._conn, pool_name)
         if not pool:
             return None, None, None
@@ -239,31 +243,65 @@ class PoolRouter:
         if not self._breakers:
             self._load_breakers(pool_name, members)
 
-        # 过滤: 模型 + 协议
-        matched = []
-        for m in members:
-            cb = self._breakers.get(m)
-            if cb is not None and not cb.allow():
-                continue  # 熔断中跳过
-            cred = integrations._config(self._conn, "credential:" + m)
-            if not cred:
-                continue
-            pname = cred.get("provider", "")
-            pentry = integrations._config(
-                self._conn, "integration_provider:" + pname) if pname else None
-            if not pentry:
-                continue
-            if model:
-                models = [x.get("id") for x in pentry.get("models", [])
-                          if isinstance(x, dict)]
-                if models and model not in models:
+        def _filter(candidates):
+            """按模型+协议过滤候选,返回 [(m, cred, pentry)]。"""
+            result = []
+            for m in candidates:
+                cb = self._breakers.get(m)
+                if cb is not None and not cb.allow():
+                    continue  # 熔断中跳过
+                cred = integrations._config(self._conn, "credential:" + m)
+                if not cred:
                     continue
-            if protocol:
+                pname = cred.get("provider", "")
+                pentry = integrations._config(
+                    self._conn, "integration_provider:" + pname) if pname else None
+                if not pentry:
+                    continue
+                if model:
+                    models = [x.get("id") for x in pentry.get("models", [])
+                              if isinstance(x, dict)]
+                    if models and model not in models:
+                        continue
+                if protocol:
+                    p_proto = integrations.normalize_legacy_protocol(
+                        pentry.get("protocol", ""))
+                    if p_proto != protocol:
+                        continue
+                result.append((m, cred, pentry))
+            return result
+
+        # 第一段: 严格同协议(透传优先)
+        same_proto = _filter(members)
+        matched = same_proto
+
+        # 第二段: 无同协议成员时,按可转换协议兜底(anthropic↔openai_chat)
+        if not matched and protocol:
+            fallback = []
+            for m in members:
+                cb = self._breakers.get(m)
+                if cb is not None and not cb.allow():
+                    continue
+                cred = integrations._config(self._conn, "credential:" + m)
+                if not cred:
+                    continue
+                pname = cred.get("provider", "")
+                pentry = integrations._config(
+                    self._conn, "integration_provider:" + pname) if pname else None
+                if not pentry:
+                    continue
+                if model:
+                    pmodels = [x.get("id") for x in pentry.get("models", [])
+                               if isinstance(x, dict)]
+                    if pmodels and model not in pmodels:
+                        continue
                 p_proto = integrations.normalize_legacy_protocol(
                     pentry.get("protocol", ""))
-                if p_proto != protocol:
-                    continue
-            matched.append((m, cred, pentry))
+                # 转换层只支持 anthropic↔openai_chat;openai_responses 等组合
+                # 不在兜底范围(is_conversion_needed 会误放,fail-loud 拒绝)
+                if integrations._proto_compatible(p_proto, protocol):
+                    fallback.append((m, cred, pentry))
+            matched = fallback
 
         if not matched:
             return None, None, None
@@ -290,15 +328,17 @@ class PoolRouter:
             cb.record_failure()
         self._persist_breakers(pool_name)
 
-        # pool_member_health 留痕
-        _update_member_health(self._conn, pool_name, member_name, success)
+        # pool_member_health 留痕(含熔断状态同步)
+        _update_member_health(self._conn, pool_name, member_name, success,
+                              circuit_state=cb.state if cb else "")
 
 
 # ---------------------------------------------------------------------------
 # pool_member_health 辅助
 # ---------------------------------------------------------------------------
-def _update_member_health(conn, pool_name, member_name, success, last_error=""):
-    """更新成员健康快照。"""
+def _update_member_health(conn, pool_name, member_name, success, last_error="",
+                          circuit_state=""):
+    """更新成员健康快照(含熔断状态留痕)。"""
     ts = now()
     row = conn.execute(
         "SELECT * FROM pool_member_health WHERE pool_name=? AND member_name=?",
@@ -307,29 +347,42 @@ def _update_member_health(conn, pool_name, member_name, success, last_error=""):
         if success:
             conn.execute(
                 "UPDATE pool_member_health SET consecutive_failures=0,"
-                " last_success_at=?, last_error=''"
+                " last_success_at=?, last_error='',"
+                " circuit_state=?, circuit_state_changed_at=?"
                 " WHERE pool_name=? AND member_name=?",
-                (ts, pool_name, member_name))
+                (ts,
+                 circuit_state if circuit_state else row["circuit_state"],
+                 ts if circuit_state else row["circuit_state_changed_at"],
+                 pool_name, member_name))
         else:
             conn.execute(
                 "UPDATE pool_member_health SET consecutive_failures=consecutive_failures+1,"
-                " last_failure_at=?, last_error=? WHERE pool_name=? AND member_name=?",
-                (ts, last_error, pool_name, member_name))
+                " last_failure_at=?, last_error=?,"
+                " circuit_state=?, circuit_state_changed_at=?"
+                " WHERE pool_name=? AND member_name=?",
+                (ts, last_error,
+                 circuit_state if circuit_state else row["circuit_state"],
+                 ts if circuit_state else row["circuit_state_changed_at"],
+                 pool_name, member_name))
     else:
         if success:
             conn.execute(
                 "INSERT INTO pool_member_health"
                 " (pool_name, member_name, consecutive_failures,"
-                " last_success_at, last_failure_at, last_error)"
-                " VALUES (?,?,0,?,0,'')",
-                (pool_name, member_name, ts))
+                " last_success_at, last_failure_at, last_error,"
+                " circuit_state, circuit_state_changed_at)"
+                " VALUES (?,?,0,?,0,'',?,?)",
+                (pool_name, member_name, ts,
+                 circuit_state or "", 0))
         else:
             conn.execute(
                 "INSERT INTO pool_member_health"
                 " (pool_name, member_name, consecutive_failures,"
-                " last_success_at, last_failure_at, last_error)"
-                " VALUES (?,?,1,0,?,?)",
-                (pool_name, member_name, ts, "upstream_error"))
+                " last_success_at, last_failure_at, last_error,"
+                " circuit_state, circuit_state_changed_at)"
+                " VALUES (?,?,1,0,?,?,?,?)",
+                (pool_name, member_name, ts, last_error or "upstream_error",
+                 circuit_state or "", ts if circuit_state else 0))
 
 
 # ---------------------------------------------------------------------------
@@ -420,28 +473,44 @@ def _clear_pool_exhausted(conn, pool_name):
 # 请求转发
 # ---------------------------------------------------------------------------
 class _ForwardError(Exception):
-    def __init__(self, code, detail="", stream_broken=False):
+    def __init__(self, code, detail="", stream_broken=False,
+                 status_code=None, resp_headers=None):
         self.code = code
         self.detail = detail
         self.stream_broken = stream_broken
+        self.status_code = status_code
+        self.resp_headers = resp_headers or {}
+
+
+def _resp_socket(conn_obj, resp):
+    """取响应底层 socket 用于调超时。上游 HTTP/1.0(will_close)时
+    getresponse() 已把 conn_obj.sock 置 None 并把连接移交给响应,
+    须从 resp.fp.raw._sock 取(SocketIO dup 的独立 fd,同一底层 socket)。"""
+    s = conn_obj.sock
+    if s is not None:
+        return s
+    fp = getattr(resp, "fp", None)
+    raw = getattr(fp, "raw", None)
+    return getattr(raw, "_sock", None)
 
 
 def _forward_http(method, url, headers, body, timeout_total,
-                  timeout_first_byte, timeout_stream_idle):
-    """通过标准库转发 HTTP 请求,返回 (status, resp_headers_dict, body_bytes)。
-    失败抛 _ForwardError(steam_broken=True 表示流中断,不可重试)。"""
+                  timeout_first_byte, timeout_stream_idle,
+                  stream_callback=None):
+    """通过标准库转发 HTTP 请求,返回 (status, resp_headers_dict, body_bytes, was_streamed)。
+    失败抛 _ForwardError(stream_broken=True 表示流中断,不可重试)。
+    单连接: SSE 在已建立的 http.client 响应上逐块流式读,绝不重发请求。"""
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     path_q = parsed.path + ("?" + parsed.query if parsed.query else "")
     use_ssl = parsed.scheme == "https"
 
-    # 初始超时=首字节,成功拿到首字节后根据 Content-Length 游标调整
     timeout = float(timeout_first_byte)
+    t_start = time.monotonic()
 
     try:
         if use_ssl:
-            # 无验证(内网/自签),创建宽松 SSL context
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -453,20 +522,85 @@ def _forward_http(method, url, headers, body, timeout_total,
 
         safe_headers = {k: v for k, v in headers.items()
                         if isinstance(v, str) and v}
-
         conn_obj.request(method, path_q, body=body, headers=safe_headers)
         resp = conn_obj.getresponse()
 
         status = resp.status
         resp_headers = {k: v for k, v in resp.getheaders()}
-        resp_body = resp.read()
-        conn_obj.close()
+        ctype = resp_headers.get("Content-Type", "")
+        is_sse = "text/event-stream" in ctype
 
+        # 错误码检查先于流式判定: 上游以 text/event-stream 返回 429/5xx
+        # 也按可重试失败处理(进 all_429 口径),不当成功透传
         if status == 429 or status >= 500:
-            raise _ForwardError("retryable",
-                                detail=f"upstream_{status}", stream_broken=False)
-        return status, resp_headers, resp_body
+            conn_obj.close()
+            raise _ForwardError(
+                "retryable", detail=f"upstream_{status}",
+                stream_broken=False, status_code=status,
+                resp_headers=resp_headers)
 
+        if is_sse and stream_callback is not None:
+            # SSE: 单连接逐块流式读(不重建连接、不重发请求)。
+            # 流空闲超时=相邻块间隔上限,总时长超时=整个流的截止。
+            deadline = t_start + float(timeout_total)
+            idle = float(timeout_stream_idle)
+            sock = _resp_socket(conn_obj, resp)
+            stream_callback.on_headers(status, resp_headers)
+            try:
+                while True:
+                    now = time.monotonic()
+                    remaining = deadline - now
+                    if remaining <= 0:
+                        raise _ForwardError(
+                            "total_timeout", detail="total timeout",
+                            stream_broken=True)
+                    if sock is not None:
+                        sock.settimeout(min(idle, remaining))
+                    try:
+                        chunk = resp.read1(65536)
+                    except socket.timeout:
+                        if time.monotonic() >= deadline:
+                            raise _ForwardError(
+                                "total_timeout", detail="total timeout",
+                                stream_broken=True)
+                        raise _ForwardError(
+                            "stream_idle_timeout",
+                            detail="stream idle timeout",
+                            stream_broken=True)
+                    if not chunk:
+                        break  # 上游 EOF(连接关闭)
+                    stream_callback.on_chunk(chunk)
+            except _ForwardError:
+                raise
+            except (ConnectionError, OSError) as exc:
+                raise _ForwardError(
+                    "upstream_stream_error", detail=str(exc),
+                    stream_broken=True)
+            finally:
+                conn_obj.close()
+            return status, resp_headers, b"", True
+
+        # 非流式: 读体受总时长截止约束(票 56 的 600s 即为此设)
+        remaining = float(timeout_total) - (time.monotonic() - t_start)
+        if remaining <= 0:
+            conn_obj.close()
+            raise _ForwardError(
+                "total_timeout", detail="total timeout",
+                stream_broken=False)
+        nsock = _resp_socket(conn_obj, resp)
+        if nsock is not None:
+            nsock.settimeout(remaining)
+        try:
+            resp_body = resp.read()
+        except socket.timeout:
+            conn_obj.close()
+            raise _ForwardError(
+                "total_timeout", detail="total timeout",
+                stream_broken=False)
+        conn_obj.close()
+        return status, resp_headers, resp_body, False
+    except _ForwardError:
+        raise
     except http.client.IncompleteRead as exc:
         raise _ForwardError("upstream_disconnect",
                             detail=str(exc), stream_broken=True)
@@ -514,11 +648,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         except _ForwardError as exc:
             code = exc.code
             detail = exc.detail
-            # 流中断不重试,直接返回错误
+            # 流已中断(已发 headers): 只能关闭连接,不能发错误响应
             if exc.stream_broken:
-                self._send_json(502, code, detail)
+                self.close_connection = True
                 return
-            # 其余错误在 _do_route 里已做重试,此处兜底
             self._send_json(502, code, detail)
         except Exception as exc:
             import sys, traceback as tb
@@ -557,10 +690,16 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         # 连接账本(每次请求新建,SQLite 本地无开销)
         conn = connect()
         try:
-            # 令牌校验
+            # 令牌校验(query / Authorization Bearer / x-api-key,优先级降序)
             qs = urllib.parse.parse_qs(path.query)
             token_list = qs.get("token", [""])
             client_token = token_list[0] if token_list else ""
+            if not client_token:
+                auth_hdr = self.headers.get("Authorization", "")
+                if auth_hdr.lower().startswith("bearer "):
+                    client_token = auth_hdr[7:].strip()
+            if not client_token:
+                client_token = self.headers.get("x-api-key", "")
             if not _verify_token(conn, pool_name, client_token):
                 self._send_json(401, "unauthorized",
                                 "invalid or missing pool token")
@@ -595,6 +734,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
             t0 = time.monotonic()
             first_token_ms = 0
+            self._first_token_ts = 0  # 首字节到达时刻(流式),on_headers 赋值
+            sw = self._StreamWriter(self, t0)
 
             # 重试循环(上限默认 5 次,进账本可配;流中断不重试由 _ForwardError 控制)
             final_member = ""
@@ -608,14 +749,19 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             last_error_detail = ""
             any_member_used = False
             _resp_sent = False
+            _stream_broken = False
             request_id = self.headers.get("X-Request-ID", "") or uuid.uuid4().hex
             session_id = self.headers.get("X-Session-ID", "")
+
+            all_429 = True
+            last_429_hdrs = {}
 
             for attempt in range(max_retries + 1):
                 member_name, cred, prov = self.router.pick(
                     pool_name, req_model, req_proto)
 
                 if member_name is None:
+                    # all_429 stays as-is: no members = exhausted due to 429-errors
                     if attempt == 0:
                         final_status = 503
                         self._send_json(
@@ -645,17 +791,61 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
                 base_url = prov.get("base_url", "")
                 proto = prov.get("protocol", "openai_chat")
-                auth_style = prov.get("auth_style", "bearer")
+                auth_style = cred.get("auth_style", "bearer")
 
                 target_url = base_url.rstrip("/") + api_path
 
                 fwd_headers = _build_fwd_headers(
                     self.headers, proto, auth_style, key_value)
 
+                # 跨协议转换:请求体从客户端协议→上游协议(失败 fail-loud → 502)
+                fwd_body = body
+                if is_converted and body:
+                    try:
+                        converted_req, _req_tags = convert_request(
+                            json.loads(body), normalized_req, normalized_resp)
+                        fwd_body = json.dumps(
+                            converted_req, ensure_ascii=False).encode("utf-8")
+                    except Exception as exc:
+                        self._send_json(
+                            502, "conversion_failed",
+                            "request convert {} -> {} failed: {}".format(
+                                normalized_req, normalized_resp, exc))
+                        _resp_sent = True
+                        break
+
+                # SSE 流式转换包装:跨协议时 wrapper 转码每块再写入下游
+                # (流方向: 上游→客户端, 故 from=上游协议, to=客户端协议)
+                fwd_sw = sw
+                if is_converted:
+                    fwd_sw = self._ConvertingStreamWriter(
+                        sw, normalized_resp, normalized_req, req_model)
+
                 try:
-                    status, resp_hdrs, resp_body = _forward_http(
-                        method, target_url, fwd_headers, body,
-                        tt, tf, ts)
+                    status, resp_hdrs, resp_body, was_streamed = _forward_http(
+                        method, target_url, fwd_headers, fwd_body,
+                        tt, tf, ts,
+                        stream_callback=fwd_sw)
+
+                    if first_token_ms == 0:
+                        first_token_ms = (time.monotonic() - t0) * 1000
+
+                    # 跨协议转换:非流式响应体从上游协议→客户端协议
+                    # (失败 fail-loud → 502,不静默透传未转换体)
+                    if is_converted and not was_streamed:
+                        try:
+                            converted_resp, _resp_tags = convert_response(
+                                json.loads(resp_body),
+                                normalized_resp, normalized_req)
+                            resp_body = json.dumps(
+                                converted_resp, ensure_ascii=False).encode("utf-8")
+                        except Exception as exc:
+                            self._send_json(
+                                502, "conversion_failed",
+                                "response convert {} -> {} failed: {}".format(
+                                    normalized_resp, normalized_req, exc))
+                            _resp_sent = True
+                            break
 
                     # Token 统计(尝试从响应提取)
                     try:
@@ -672,41 +862,68 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     final_elapsed_ms = (time.monotonic() - t0) * 1000
                     final_status = status
                     final_is_converted = is_converted
+                    # is_stream: 流式请求=True,非流式=False
+                    final_is_stream = was_streamed
+                    # first_token_ms: 流式=_first_token_ts(首块到达),非流式=总耗时
+                    if was_streamed:
+                        first_token_ms = self._first_token_ts or (time.monotonic() - t0) * 1000
+                    else:
+                        first_token_ms = final_elapsed_ms
+                    # model: 实际路由到的成员名(非抄 request_model)
+                    final_model = member_name
                     self.router.record(pool_name, member_name, True)
+                    all_429 = False
                     # 落行在前(修时序): 客户端收到 200 时日志已提交
                     _log_request(
-                        conn, pool_name, final_member, req_model, req_model,
+                        conn, pool_name, final_member, req_model, final_model,
                         final_status, final_elapsed_ms, first_token_ms,
                         final_input_tokens, final_output_tokens,
                         final_is_stream, final_is_converted, session_id, request_id)
-                    self._send_resp(status, resp_hdrs, resp_body)
+                    if was_streamed:
+                        sw.on_complete()
+                    else:
+                        self._send_resp(status, resp_hdrs, resp_body)
                     _resp_sent = True
                     # 成功: 清池耗尽标记
                     _clear_pool_exhausted(conn, pool_name)
                     break
                 except _ForwardError as exc:
+                    # Only update all_429/final_status for actual HTTP status codes;
+                    # connection errors (status_code=None) preserve existing state
+                    if exc.status_code is None:
+                        pass  # connection error: keep all_429 and final_status as-is
+                    else:
+                        all_429 = all_429 and (exc.status_code == 429)
+                        final_status = exc.status_code
+                        if exc.status_code == 429 and exc.resp_headers:
+                            last_429_hdrs = exc.resp_headers
                     final_member = member_name
                     final_protocol = prov.get("protocol", "")
                     final_elapsed_ms = (time.monotonic() - t_try_start) * 1000
-                    final_status = 502
                     final_is_converted = is_converted
                     last_error_detail = exc.detail or ""
                     self.router.record(pool_name, member_name, False)
                     if exc.stream_broken:
+                        _stream_broken = True
                         break
 
             # 一行日志: 取"产生最终结果的那次尝试"(成功路径已提前落行,此处仅兜底失败路径)
             if final_member and not _resp_sent:
+                # 失败路径:first_token_ms 已在流式首块时写入 self._first_token_ts
+                if self._first_token_ts:
+                    first_token_ms = self._first_token_ts
                 _log_request(
-                    conn, pool_name, final_member, req_model, req_model,
+                    conn, pool_name, final_member, req_model, final_member,
                     final_status, final_elapsed_ms, first_token_ms,
                     final_input_tokens, final_output_tokens,
                     final_is_stream, final_is_converted, session_id, request_id)
 
             # 成员健康: 失败次数 + 失败详情传递
             if final_member and final_status >= 400:
+                cb = (self.router._breakers or {}).get(final_member)
                 _update_member_health(
-                    conn, pool_name, final_member, False, last_error_detail)
+                    conn, pool_name, final_member, False, last_error_detail,
+                    circuit_state=cb.state if cb else "")
 
             # 重试耗尽 → 池耗尽标记(无论 members 耗尽还是全员失败)
             if not any_member_used and final_status in (502, 503):
@@ -714,10 +931,19 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             elif any_member_used and final_status >= 400 and not _resp_sent:
                 _set_pool_exhausted(conn, pool_name)
 
+            # 429 透传: 全员 429 → 透传 429,只带 Retry-After(全量透传会与自身
+            # JSON 载荷的 Content-Length/Content-Type 冲突)
+            if not _resp_sent and not _stream_broken and all_429 and last_429_hdrs:
+                retry_hdrs = {k: v for k, v in last_429_hdrs.items()
+                              if k.lower() == "retry-after"}
+                self._send_json(final_status, "all_members_retry_later",
+                                "all members rate-limited",
+                                extra_headers=retry_hdrs)
             # 重试耗尽但未发响应 → 502
-            if not _resp_sent:
+            elif not _resp_sent and not _stream_broken:
                 self._send_json(502, "all_members_failed",
                                 "pool={} status={}".format(pool_name, final_status))
+
         finally:
             conn.close()
 
@@ -732,11 +958,90 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_json(self, status, code, detail):
+    def _send_stream_headers(self, status, headers):
+        self.send_response(status)
+        for k, v in headers.items():
+            if k.lower() in ("transfer-encoding", "content-length",
+                             "connection", "keep-alive",
+                             "content-encoding"):
+                continue
+            self.send_header(k, v)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+    class _ConvertingStreamWriter:
+        """SSE 跨协议转换包装器: 每块经 stream_convert 转码后写入下游。"""
+
+        def __init__(self, wrapped, from_proto, to_proto, model=""):
+            self._w = wrapped
+            self._fp = from_proto
+            self._tp = to_proto
+            self._model = model
+            self._buf = b""
+
+        def on_headers(self, status, headers):
+            self._w.on_headers(status, headers)
+
+        def on_chunk(self, data):
+            self._buf += data
+            parts = self._buf.split(b"\n\n")
+            self._buf = parts[-1]
+            for part in parts[:-1]:
+                txt = part.decode("utf-8", "replace")
+                converted = "".join(
+                    stream_convert(
+                        iter([txt + "\n\n"]),
+                        self._fp, self._tp, self._model))
+                if converted:
+                    self._w.on_chunk(converted.encode("utf-8"))
+
+        def on_complete(self):
+            if self._buf:
+                txt = self._buf.decode("utf-8", "replace")
+                converted = "".join(
+                    stream_convert(
+                        iter([txt]),
+                        self._fp, self._tp, self._model))
+                if converted:
+                    self._w.on_chunk(converted.encode("utf-8"))
+            self._w.on_complete()
+
+    class _StreamWriter:
+        def __init__(self, handler, t0):
+            self._h = handler
+            self._done = False
+            self._t0 = t0
+
+        def on_headers(self, status, headers):
+            # 首字节/首块到达:记录时刻供 first_token_ms 使用
+            import time as _time
+            self._h._first_token_ts = (_time.monotonic() - self._t0) * 1000
+            self._h._send_stream_headers(status, headers)
+            self._done = True
+
+        def on_chunk(self, data):
+            hex_len = "{:x}\r\n".format(len(data)).encode("ascii")
+            self._h.wfile.write(hex_len)
+            self._h.wfile.write(data)
+            self._h.wfile.write(b"\r\n")
+            self._h.wfile.flush()
+
+        def on_complete(self):
+            self._done = True
+            try:
+                self._h.wfile.write(b"0\r\n\r\n")
+                self._h.wfile.flush()
+            except OSError:
+                pass
+
+    def _send_json(self, status, code, detail, extra_headers=None):
         payload = json.dumps({"error": code, "detail": detail}).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
         self.end_headers()
         self.wfile.write(payload)
 

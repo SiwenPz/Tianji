@@ -450,7 +450,7 @@ class TestQualityAxes:
         ops.instance_register(conn, "rb-dev", SHELL_CODEX, "rb-model",
                               key_name="rebind-key")
         # 下线
-        ops.instance_unbind(conn, "rb-dev", request_id="r-unbind")
+        ops.instance_unbind(conn, controller, "rb-dev", request_id="r-unbind")
         # 复活(同模型=换绑,两轴归零)
         ops.instance_register(conn, "rb-dev", SHELL_CODEX, "rb-model",
                               key_name="rebind-key")

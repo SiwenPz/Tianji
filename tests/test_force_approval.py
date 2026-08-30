@@ -5,8 +5,8 @@
 2. 兜底跳转(目标态是三种之外)创建审批请求,不生效
 3. 审批请求可批准,批准后迁移生效
 4. 审批请求可驳回,驳回后迁移不生效
-5. 超时未批标记 expired
-6. 身份校验: 发起人须总控,批准人须用户
+5. 超时未批标记 expired(ops 层直测 + monitor._tick 巡检顺带闭环)
+6. 身份校验: 发起人须总控,批准人须用户(总控/发起人自批被拦,ops+CLI+web 三层)
 7. 已处理/非本人不可操作
 """
 
@@ -14,12 +14,15 @@ import json
 import os
 
 import pytest
+from typer.testing import CliRunner
 
+from tianji.cli import app
 from tianji import ops
 from tianji.db import now
 from tianji.events import ingest_event
-from tianji.monitor import _tick
 from tianji.render import spawn
+
+runner = CliRunner()
 
 
 def _to_executing(conn, controller, worker):
@@ -37,6 +40,32 @@ def _to_executing(conn, controller, worker):
     ingest_event(conn, env, {"session_id": "s", "event_type": "session_start"})
     ingest_event(conn, env, {"session_id": "s", "event_type": "pre_tool_use"})
     return tid, did
+
+
+def _register_controller(conn, name):
+    """Register a controller instance and return identity dict."""
+    ctrl = ops.instance_register(
+        conn, name, "claude", "step-router-v1", controller=True)
+    return {"worker_id": ctrl["name"], "secret": ctrl["secret"]}
+
+
+def _register_worker(conn, name):
+    """Register a worker instance and return identity dict."""
+    wkr = ops.instance_register(conn, name, "claude", "step-router-v1")
+    return {"worker_id": wkr["name"], "secret": wkr["secret"]}
+
+
+def _setup_approval(conn, controller, worker):
+    """Create a task + dispatch + force_approval for testing."""
+    tid = ops.task_new(conn, controller, "HITL审批测试", request_id="r-hitl")["task_id"]
+    ops.task_transition(conn, controller, tid, "discussing", request_id="r-hitl-d")
+    ops.task_transition(conn, controller, tid, "awaiting_plan_confirm", request_id="r-hitl-ap")
+    ops.task_transition(conn, controller, tid, "dispatched", request_id="r-hitl-dp")
+    ops.dispatch_issue(conn, controller, tid, worker["worker_id"],
+                       request_id="r-hitl-issue")
+    result = ops.task_force(conn, controller, tid, "reviewing", "HITL测试兜底",
+                            request_id="r-hitl-fb")
+    return tid, result["approval_id"]
 
 
 # ====================================================================
@@ -282,3 +311,160 @@ def test_force_approval_audit_trail(conn, controller, worker):
         " AND detail LIKE ?",
         (f'%"approval_id": {aid}%',)).fetchone()
     assert aud2 is not None
+
+
+# ====================================================================
+# 超时闭环(task-02 新增): _tick 巡检顺带过期 + force_approve 双保险
+# ====================================================================
+
+class TestForceApprovalTimeout:
+    """expire: 24h auto-expire via monitor tick + force_approve rejects expired."""
+
+    def test_24h_expire_via_monitor(self, conn):
+        """超期请求经 monitor._tick 巡检顺带标记 expired(真走 _tick)。"""
+        from tianji.monitor import _tick
+        ctrl = _register_controller(conn, "CTRL-EXPIRE")
+        wkr = _register_worker(conn, "WKR-EXPIRE")
+        tid, aid = _setup_approval(conn, ctrl, wkr)
+        # 把 created_at 手动改成 2 天前
+        old_ts = ops.now() - 86400 * 2
+        conn.execute(
+            "UPDATE force_approvals SET created_at=? WHERE id=?",
+            (old_ts, aid))
+        conn.commit()
+        # _tick 前仍是 pending(防恒真)
+        assert conn.execute(
+            "SELECT status FROM force_approvals WHERE id=?",
+            (aid,)).fetchone()["status"] == "pending"
+        _tick(conn, {})
+        r = conn.execute(
+            "SELECT * FROM force_approvals WHERE id=?", (aid,)).fetchone()
+        assert r["status"] == "expired"
+
+    def test_force_approve_rejects_expired(self, conn):
+        """force_approve 对超期请求返回 expired decision(双保险)。"""
+        ctrl = _register_controller(conn, "CTRL-EXPIRED")
+        wkr = _register_worker(conn, "WKR-EXPIRED")
+        tid, aid = _setup_approval(conn, ctrl, wkr)
+        old_ts = ops.now() - 86400 * 2
+        conn.execute(
+            "UPDATE force_approvals SET created_at=? WHERE id=?",
+            (old_ts, aid))
+        conn.commit()
+        # 超时请求: force_approve 返回 expired 决策而非抛异常
+        result = ops.force_approve(conn, ctrl["worker_id"], aid)
+        assert result["decision"] == "expired"
+        assert "超时" in result.get("reason", "") or "expired" in result.get("reason", "")
+
+
+# ====================================================================
+# 自批拦截(task-02 新增): ops 层 + CLI 层
+# ====================================================================
+
+class TestForceSelfApproveBlocked:
+    """Self-approval blocked at ops layer + CLI negative test."""
+
+    def test_ops_self_approve_blocked(self, conn):
+        """ops 层: approver == initiator_id → PermissionError(禁止自批)。"""
+        ctrl = _register_controller(conn, "CTRL-SELF")
+        wkr = _register_worker(conn, "WKR-SELF")
+        tid, aid = _setup_approval(conn, ctrl, wkr)
+        with pytest.raises(PermissionError, match="禁止自批"):
+            ops.force_approve(conn, ctrl["worker_id"], aid)
+
+    def test_cli_self_approve_blocked(self, conn):
+        """CLI 层: 同一身份批准自己发起的请求 → exit_code != 0。"""
+        ctrl = _register_controller(conn, "CTRL-CLI")
+        wkr = _register_worker(conn, "WKR-CLI")
+        tid, aid = _setup_approval(conn, ctrl, wkr)
+        env = {"TIANJI_WORKER_ID": ctrl["worker_id"],
+               "TIANJI_SECRET": ctrl["secret"],
+               "TIANJI_HOME": os.environ["TIANJI_HOME"]}
+        r = runner.invoke(app, ["task", "approve-force", str(aid)], env=env)
+        assert r.exit_code != 0
+        combined = (r.output or "") + (r.exception and str(r.exception) or "")
+        assert "禁止自批" in combined or "Permission" in combined
+
+
+class TestForceRejectSelfBlocked:
+    """force_reject also blocks self-approval."""
+
+    def test_reject_self_blocked(self, conn):
+        ctrl = _register_controller(conn, "CTRL-REJ")
+        wkr = _register_worker(conn, "WKR-REJ")
+        tid, aid = _setup_approval(conn, ctrl, wkr)
+        with pytest.raises(PermissionError, match="禁止自批"):
+            ops.force_reject(conn, ctrl["worker_id"], aid)
+
+
+class TestForceNormalFlow:
+    """Normal approval/rejection path unaffected."""
+
+    def test_other_controller_can_approve(self, conn):
+        """Different controller can approve → task moves to reviewing."""
+        ctrl = _register_controller(conn, "CTRL-OK-A")
+        wkr = _register_worker(conn, "WKR-OK-A")
+        tid, aid = _setup_approval(conn, ctrl, wkr)
+        # 注册另一总控,通过 controller 身份校验
+        other = ops.instance_register(
+            conn, "OTHER-CTRL", "claude", "step-router-v1",
+            controller=True, ident=ctrl)
+        result = ops.force_approve(conn, other["name"], aid)
+        assert result["decision"] == "approved"
+        t = ops.task_get(conn, tid)
+        assert t["status"] == "reviewing"
+
+    def test_other_controller_can_reject(self, conn):
+        """Different controller can reject → task stays dispatched."""
+        ctrl = _register_controller(conn, "CTRL-OK-R")
+        wkr = _register_worker(conn, "WKR-OK-R")
+        tid, aid = _setup_approval(conn, ctrl, wkr)
+        other = ops.instance_register(
+            conn, "OTHER-CTRL2", "claude", "step-router-v1",
+            controller=True, ident=ctrl)
+        result = ops.force_reject(conn, other["name"], aid)
+        assert result["decision"] == "rejected"
+
+
+# ====================================================================
+# web 层(task-02 新增): /api/force/approve 总控自批 403,无身份用户放行
+# ====================================================================
+
+class TestForceApproveWeb:
+    """web 层 HITL 门: 总控身份自批 403,无身份(用户)批准生效。"""
+
+    def test_web_controller_self_approve_403(self, conn, monkeypatch):
+        from fastapi.testclient import TestClient
+        from tianji.webapp import app as web_app
+        ctrl = _register_controller(conn, "CTRL-WEB")
+        wkr = _register_worker(conn, "WKR-WEB")
+        tid, aid = _setup_approval(conn, ctrl, wkr)
+        # 页面注入总控身份(15.3)→ HITL 端点拒绝自批
+        monkeypatch.setenv("TIANJI_WORKER_ID", ctrl["worker_id"])
+        monkeypatch.setenv("TIANJI_SECRET", ctrl["secret"])
+        client = TestClient(web_app)
+        r = client.post("/api/force/approve",
+                        json={"approval_id": aid, "decision": "approve"})
+        assert r.status_code == 403
+        assert "自批" in r.json()["error"]
+        # 请求未被批准,仍 pending
+        row = conn.execute(
+            "SELECT status FROM force_approvals WHERE id=?",
+            (aid,)).fetchone()
+        assert row["status"] == "pending"
+
+    def test_web_user_approve_ok(self, conn, monkeypatch):
+        from fastapi.testclient import TestClient
+        from tianji.webapp import app as web_app
+        ctrl = _register_controller(conn, "CTRL-WEB2")
+        wkr = _register_worker(conn, "WKR-WEB2")
+        tid, aid = _setup_approval(conn, ctrl, wkr)
+        # 无身份=用户(人)操作,批准生效
+        monkeypatch.delenv("TIANJI_WORKER_ID", raising=False)
+        monkeypatch.delenv("TIANJI_SECRET", raising=False)
+        client = TestClient(web_app)
+        r = client.post("/api/force/approve",
+                        json={"approval_id": aid, "decision": "approve"})
+        assert r.status_code == 200, r.text
+        assert r.json()["decision"] == "approved"
+        assert ops.task_get(conn, tid)["status"] == "reviewing"

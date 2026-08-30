@@ -150,7 +150,7 @@ def decide(conn, ident, ruling_id: int, allow: bool, reason: str = "",
 
 
 def hook_response(conn, shell: str, worker_id: str, tool: str) -> dict:
-    """钩子允许类壳的适配器应答(6.6): 查账本裁决,无 allowed 裁决即拒。
+    """钩子允许类壳的适配器应答(6.6): 查账本裁决,无 allowed 裁决即拒(fail-loud)。
 
     无头默认=天然拒绝: claude -p 等无头形态无人可问,挂起即失败即拒。
 
@@ -158,7 +158,15 @@ def hook_response(conn, shell: str, worker_id: str, tool: str) -> dict:
     - cc   → Claude Code 兼容 PermissionRequest 钩子应答格式
     - bare → codex 裸格式 {"decision": "allow"|"deny"}
     hook_action 决定 deny/cancel 行为。
+
+    Fail-loud: 必填参数为空时抛 ValueError,不静默默认(5.6)。
     """
+    if not shell:
+        raise ValueError("shell 不能为空")
+    if not worker_id:
+        raise ValueError("worker_id 不能为空")
+    if not tool:
+        raise ValueError("tool 不能为空")
     r = conn.execute(
         "SELECT id FROM permission_rulings WHERE worker_id=? AND tool=?"
         " AND status='allowed' ORDER BY id DESC LIMIT 1",

@@ -288,6 +288,8 @@ class _FakeHandler(BaseHTTPRequestHandler):
         _do_route_impl = _ProxyHandlerCls._do_route_impl
         _send_resp = _ProxyHandlerCls._send_resp
         _send_json = _ProxyHandlerCls._send_json
+        _StreamWriter = _ProxyHandlerCls._StreamWriter
+        _send_stream_headers = _ProxyHandlerCls._send_stream_headers
 
 
 class _FakeHandlerFactory:
@@ -392,8 +394,9 @@ class TestProxyHandler:
             call_count[0] += 1
             if call_count[0] == 1:
                 raise _ForwardError("upstream_429", detail="rate_limited",
-                                    stream_broken=False)
-            return 200, {"Content-Type": "application/json"}, b'{"ok":true}'
+                                    stream_broken=False, status_code=429)
+            return (200, {"Content-Type": "application/json"},
+                    b'{"ok":true}', False)
 
 
         from tianji.proxy import _pool as pool_mod
@@ -409,6 +412,8 @@ class TestProxyHandler:
                               path=f"/proxy/{pctx['pool_name']}/v1/chat/completions?token={pool_token}")
             h._do_route("POST")
             assert call_count[0] == 2  # 第一次 429 重试,第二次成功
+            # 第二次成功响应确实透传回客户端
+            assert b'{"ok":true}' in h.wfile.content
         finally:
             pool_mod._forward_http = orig_fwd
 

@@ -234,7 +234,7 @@ TEMPLATE_CODEX: dict = {
     "provider_env": {
         "target": "process_env",
         "map": {
-            "CODEX_WIZARD_KEY": "${key}",
+            "CODEX_WIZARD_KEY": "{key}",
         },
     },
     # 适配器
@@ -418,7 +418,7 @@ TEMPLATE_KIMI: dict = {
         "target": "process_env",
         "map": {
             "KIMI_MODEL_NAME": "{model}",
-            "KIMI_MODEL_API_KEY": "${key}",
+            "KIMI_MODEL_API_KEY": "{key}",
             "KIMI_MODEL_BASE_URL": "{base_url}",
             "KIMI_MODEL_PROVIDER_TYPE": "{protocol}",
         },

@@ -40,7 +40,7 @@ class TestAbilityProfileFields:
             skills='["old"]', context_window=64000,
             permission_granularity="readonly", profile_notes="旧坑",
             key_name="rebind-key")
-        ops.instance_unbind(conn, "rebind-p", request_id="r-unbind")
+        ops.instance_unbind(conn, controller, "rebind-p", request_id="r-unbind")
         ops.instance_register(
             conn, "rebind-p", "codex", "new-model",
             skills='["new"]', context_window=128000,
@@ -123,3 +123,20 @@ class TestInstanceDelete:
     def test_delete_unknown_instance(self, conn, controller):
         with pytest.raises(KeyError, match="未注册"):
             ops.instance_delete(conn, controller, "ghost", request_id="r-del-ghost")
+
+
+class TestInstanceUnbind:
+    """实例换绑/下线(14.3 回收需总控确认)。"""
+
+    def test_unbind_requires_controller(self, conn, controller, worker):
+        """非总控 unbind 被拒绝(对照 instance_delete 同强度)。"""
+        _register_shell_key_multi(conn, controller, "unbind-key")
+        ops.instance_register(conn, "unbind-dev", "codex", "step-router-v1",
+                              key_name="unbind-key")
+        with pytest.raises(PermissionError,
+                           match="instance_unbind 仅总控身份可执行"):
+            ops.instance_unbind(conn, worker, "unbind-dev",
+                                request_id="r-noctrl")
+        r = ops.instance_unbind(conn, controller, "unbind-dev",
+                                request_id="r-ctrl")
+        assert r["is_active"] == 0

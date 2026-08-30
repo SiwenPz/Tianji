@@ -316,39 +316,14 @@ def test_reschedule_after_review_reject_goes_to_worker(conn, controller):
 # 额外: config_set JSON 合法性预校验 + old_value 审计
 # ====================================================================
 
-def test_config_set_quality_axis_requires_valid_json(conn, controller):
+def test_config_set_quality_axis_rejects_invalid_json(conn, controller):
     """quality_axis_checklist 写入非 JSON 应被拒绝(fail-loud)。"""
     with pytest.raises(ValueError, match="JSON"):
         ops.config_set(conn, controller, "quality_axis_checklist",
                        "这不是合法的JSON", request_id="r-bad-json")
 
 
-def test_config_set_audit_contains_old_value(conn, controller):
-    """config_set 审计行应包含 old_value(预审 P2 #11)。"""
-    ops.config_set(conn, controller, "expect_min_default", "60",
-                   request_id="r-audit1")
-    ops.config_set(conn, controller, "expect_min_default", "90",
-                   request_id="r-audit2")
-    rows = conn.execute(
-        "SELECT detail FROM audit WHERE action='config_set' ORDER BY ts"
-    ).fetchall()
-    assert len(rows) >= 2
-    detail = json.loads(rows[-1]["detail"])
-    assert detail.get("old_value") == "60"
-
-
-# ====================================================================
-# 额外: config_set JSON 合法性预校验 + old_value 审计
-# ====================================================================
-
-def test_config_set_quality_axis_requires_valid_json(conn, controller):
-    """quality_axis_checklist 写入非 JSON 应被拒绝(fail-loud)。"""
-    with pytest.raises(ValueError, match="JSON"):
-        ops.config_set(conn, controller, "quality_axis_checklist",
-                       "这不是合法的JSON", request_id="r-bad-json")
-
-
-def test_config_set_audit_contains_old_value(conn, controller):
+def test_config_set_audit_tracks_old_value(conn, controller):
     """config_set 审计行应包含 old_value(预审 P2 #11)。"""
     ops.config_set(conn, controller, "expect_min_default", "60",
                    request_id="r-audit1")

@@ -203,8 +203,8 @@ def test_pool_wizard_integration(tianji_home):
         assert len(r["members"]) == 1
         pool_token = r["token"]
         assert len(pool_token) == 64
-        # 预置 proxy 端口(模拟 daemon 已启动)
-        ops.config_set(conn, ident, "daemon.proxy_port", "9876",
+        # 预置 proxy 端口(与真实 proxy 端口对齐,使 render() 产出的 base_url 可达)
+        ops.config_set(conn, ident, "daemon.proxy_port", "19008",
                        request_id="e2e-proxy-port")
         # 3. create instance bound to pool
         iso = tianji_home / "instances" / "rev1-claude"
@@ -289,14 +289,58 @@ def test_pool_wizard_integration(tianji_home):
         try:
             import time as _time
             _time.sleep(0.5)
+            # 使用真实渲染产物构造 proxy 请求(不再手工拼 URL)
+            rendered_cmd, rendered_arts = render(conn, "claude",
+                instance="rev1", model="deepseek-v4-flash",
+                key_name="test-pool", isolated_dir=str(iso))
+            settings_data = json.loads(
+                Path(rendered_arts[0]).read_text(encoding="utf-8"))
+            rendered_base_url = settings_data["env"]["ANTHROPIC_BASE_URL"]
+            pool_token_auth = settings_data["env"]["ANTHROPIC_AUTH_TOKEN"]
+            # base_url 含 /proxy/<池名> 路径;按壳真实拼 URL 方式追加 API 路径
+            # 代理路由协议: token 走 Authorization Bearer 头(非 query)
+            proxy_url = f"{rendered_base_url}/v1/chat/completions"
             body = json.dumps({"model": "test-model"}).encode()
             req = urllib.request.Request(
-                f"http://127.0.0.1:{proxy_port}/proxy/test-pool"
-                f"/v1/chat/completions?token={pool_token}",
-                data=body, headers={"Content-Type": "application/json"},
+                proxy_url,
+                data=body,
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {pool_token_auth}"},
                 method="POST")
             resp = urllib.request.urlopen(req, timeout=10)
             assert resp.status == 200
+            # 负例: 无令牌→401
+            no_token_req = urllib.request.Request(
+                proxy_url, data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            try:
+                urllib.request.urlopen(no_token_req, timeout=5)
+                assert False, "Should have raised HTTPError"
+            except urllib.error.HTTPError as e:
+                assert e.code == 401
+            # 负例: 错令牌→401
+            bad_token_req = urllib.request.Request(
+                proxy_url, data=body,
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer wrong-token-xxx"},
+                method="POST")
+            try:
+                urllib.request.urlopen(bad_token_req, timeout=5)
+                assert False, "Should have raised HTTPError"
+            except urllib.error.HTTPError as e:
+                assert e.code == 401
+            # 负例: 错误路径(非 /proxy/<池>)→400
+            bad_path_url = f"{rendered_base_url.rsplit('/proxy/', 1)[0]}/not-proxy/test/v1/chat"
+            bad_path_req = urllib.request.Request(
+                bad_path_url, data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            try:
+                urllib.request.urlopen(bad_path_req, timeout=5)
+                assert False, "Should have raised HTTPError"
+            except urllib.error.HTTPError as e:
+                assert e.code == 400
             # pool_request_logs 落行(修B: 经池出活完整闭环)
             # 轮询兜底: 代理线程写日志可能在客户端收到 200 之后微秒级提交
             import time as _time

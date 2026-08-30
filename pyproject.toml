@@ -10,7 +10,7 @@ requires-python = ">=3.9"
 dependencies = ["typer", "fastapi", "uvicorn"]
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx"]
+dev = ["pytest", "httpx", "zstandard"]
 
 [project.scripts]
 tianji = "tianji.cli:app"

@@ -156,17 +156,20 @@ def _read_cursor(conn: sqlite3.Connection, key: str) -> dict:
     if row is None:
         return {"path": "", "offset": 0}
     try:
-        return json.loads(row["last_seq"])
+        data = json.loads(row["last_seq"])
+        if not isinstance(data, dict):
+            return {"path": "", "offset": 0}
+        return data
     except (json.JSONDecodeError, TypeError):
         return {"path": "", "offset": 0}
 
 
 def _write_cursor(
-    conn: sqlite3.Connection, key: str, path: str, offset: int,
+    conn: sqlite3.Connection, key: str, cursor: dict,
 ) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO cursors (consumer_id, last_seq) VALUES (?,?)",
-        (key, json.dumps({"path": path, "offset": offset})),
+        (key, json.dumps(cursor)),
     )
 
 
@@ -182,16 +185,40 @@ def _process_file(
     str_path = str(path)
     cursor_key = _cursor_key(tpl.name, str_path)
     cur = _read_cursor(conn, cursor_key)
-    if cur.get("path") != str_path:
+    is_zstd = path.suffix == ".zstd"
+    if cur.get("path") != str_path or (is_zstd and "offset" not in cur):
         cur = {"path": str_path, "offset": 0}
+        if is_zstd:
+            cur["compressed_size"] = 0
 
     file_size = path.stat().st_size
-    if file_size <= cur["offset"]:
-        return
+    # 活性字节数先记账: zstd 用压缩尺寸差,普通文件用字节偏移差
+    new_bytes = file_size - cur.get("compressed_size", cur["offset"])
+    if is_zstd:
+        # zstd 压缩流不支持字节寻址;用行号计数追踪增量
+        if file_size == cur.get("compressed_size") and cur["offset"] > 0:
+            return  # 文件未变大且已有处理记录 → 无新行
+        cur["compressed_size"] = file_size
+    else:
+        if file_size <= cur["offset"]:
+            return
 
-    new_bytes = file_size - cur["offset"]
     lines = _read_new_lines(path, cur["offset"])
-    cur["offset"] = file_size
+    if lines is None:
+        # 无 zstandard 库降级(E.3/票 26): 不崩——压缩字节数已推进游标,
+        # 活性字节计数(new_bytes)不受影响;事件级解析跳过,游标照常落盘,
+        # 实例档案如实记"转录压缩未解析"(不重复刷)。
+        _record_zstd_unparsed(conn, session_id)
+        with tx(conn) as c:
+            _write_cursor(c, cursor_key, cur)
+        summary["files_processed"] += 1
+        summary["new_bytes"] += new_bytes
+        summary["transcript_note"] = "转录压缩未解析(无 zstandard 库)"
+        return
+    if not is_zstd:
+        cur["offset"] = file_size
+    else:
+        cur["offset"] = cur["offset"] + len(lines)
 
     events_count = 0
     for line in lines:
@@ -213,11 +240,33 @@ def _process_file(
             pass
 
     with tx(conn) as c:
-        _write_cursor(c, cursor_key, str_path, cur["offset"])
+        _write_cursor(c, cursor_key, cur)
 
     summary["files_processed"] += 1
     summary["events_emitted"] += events_count
     summary["new_bytes"] += new_bytes
+
+
+def _record_zstd_unparsed(conn: sqlite3.Connection, session_id: str) -> None:
+    """zstd 转录未解析的如实记录(9.1 档案口径,与 quota/monitor 同路数)。
+
+    由 session_states 反查实例名写能力画像 notes;画像不存在不补建,
+    已记过不重复刷(每次增量解析都会走到这里)。
+    """
+    row = conn.execute(
+        "SELECT instance_name FROM session_states WHERE session_id=?",
+        (session_id,)).fetchone()
+    if row is None:
+        return
+    name = row["instance_name"]
+    prof = conn.execute(
+        "SELECT notes FROM ability_profiles WHERE instance_name=?",
+        (name,)).fetchone()
+    if prof is None or "转录压缩未解析" in (prof["notes"] or ""):
+        return
+    from tianji import ops
+    ops.update_profile_notes(
+        conn, name, "转录压缩未解析(无 zstandard 库,按字节数保活性兜底)")
 
 
 # cline 完成态集合(除 running 外 sessions.db 的终态;中间态不能一律当完成)
@@ -355,8 +404,36 @@ def _process_sqlite(
     summary["new_bytes"] += path.stat().st_size
 
 
-def _read_new_lines(path: Path, offset: int) -> list[str]:
-    """从文件偏移量处读取新行(不加载整个文件到内存)。"""
+def _read_new_lines(path: Path, offset: int) -> "list[str] | None":
+    """从文件偏移量处读取新行(支持 zstd 压缩,lazy 加载)。
+
+    - 普通文件: 字节偏移 seek 读取。
+    - .zstd 文件: 整文件流式解压后按行号计数取新增行
+      (zstd 压缩流不支持随机字节寻址,故改用行号追踪增量)。
+    - .zstd 但无 zstandard 库: 返回 None 降级哨兵(由 _process_file 兜底)。
+    """
+    if path.suffix == ".zstd":
+        # zstd 压缩文件: 流式解压,按行号偏移取新增。
+        # zstandard 是第三方库(核心选型纯标准库,规格 19.1),懒加载:
+        # 无库时返回 None 哨兵,由调用方走降级(不崩+字节数保活性+如实记录)。
+        try:
+            import zstandard as zstd
+        except ImportError:
+            return None
+        dctx = zstd.ZstdDecompressor()
+        with open(path, "rb") as f:
+            with dctx.stream_reader(f) as reader:
+                data = reader.read().decode("utf-8", errors="replace")
+        all_lines = data.splitlines(keepends=True)
+        result = []
+        skipped = 0
+        for line in all_lines:
+            if skipped < offset:
+                skipped += 1
+                continue
+            result.append(line)
+        return result
+    # 普通文本文件: 字节偏移 seek
     lines = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         f.seek(offset)

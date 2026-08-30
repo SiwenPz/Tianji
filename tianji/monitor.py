@@ -163,7 +163,8 @@ def _check_tier3_capability(conn, shell: str, pid: int = 0) -> bool:
     if not pid or not adapter:
         return False
     try:
-        if adapter == "codex":
+        output_file = adapter.get("output_file", "") if isinstance(adapter, dict) else ""
+        if "codex" in output_file:
             from .adapters.codex_exec import codex_exec_alive
             return codex_exec_alive(pid)
     except Exception:
@@ -493,6 +494,16 @@ def _tick(conn, state: dict):
         with tx(conn) as c:
             # 断点摘要(7.5): 读取旧会话转录尾部+任务书+产物清单
             _append_breakpoint_summary(conn, d["id"], r["instance_name"])
+            # 读回摘要,传递给新派单
+            d_updated = conn.execute("SELECT payload FROM dispatches WHERE id=?",
+                                     (d["id"],)).fetchone()
+            bp_summary = None
+            if d_updated:
+                try:
+                    bp_summary = json.loads(d_updated["payload"] or "{}").get(
+                        "breakpoint_summary")
+                except Exception:
+                    pass
             c.execute(
                 "UPDATE dispatches SET status='requeue', updated_at=? WHERE id=?",
                 (now(), d["id"]))
@@ -518,9 +529,25 @@ def _tick(conn, state: dict):
         if t and t["status"] in ("dispatched", "executing"):
             with tx(conn) as c:
                 off_susp = bool(offline) or r["offline_suspicion"] == 1
-                _deduct_score(c, r["instance_name"], 10, offline_suspicion=off_susp)
+                if not off_susp:
+                    dm = c.execute(
+                        "SELECT expect_min FROM dispatches "
+                        "WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                        (d["task_id"],)).fetchone()
+                    em = dm["expect_min"] if dm else 30
+                    try:
+                        ops.update_score(c, r["instance_name"],
+                                         "process_dead", em)
+                    except KeyError:
+                        pass
+                else:
+                    ops.audit(c, "monitor_score_exempt",
+                              {"worker_id": r["instance_name"],
+                               "reason": "offline_suspicion"})
                 ops._reschedule(c, d["task_id"], r["instance_name"],
-                                "进程退出无结算(确定性重派 7.4②)", skip_score=True)
+                                "进程退出无结算(确定性重派 7.4②)",
+                                skip_score=True,
+                                breakpoint_summary=bp_summary)
             _escalate(conn, state, d["task_id"], r["instance_name"],
                       "进程退出无结算已确定性重派,新派单请 spawn(7.4②)",
                       "requeue")
@@ -556,7 +583,8 @@ def _tick(conn, state: dict):
         elif size is None:
             hb[r["instance_name"]] = cur
         elif cur > size:
-            # 档 3 兜底: 壳条目声明 tier3_process_alive 则豁免(不再写死 codex 壳名)
+            # 档 3 兜底: 壳条目声明 tier3_process_alive 则豁免(tier3 验证按
+            # adapter 的 output_file 派发,目前仅 codex_exec 有实现,其余壳按无 tier3 处理)
             tier3_alive = _check_tier3_capability(conn, shell, pid=r["pid"])
             if tier3_alive:
                 hb[r["instance_name"]] = cur
@@ -602,6 +630,53 @@ def _tick(conn, state: dict):
             _escalate(conn, state, t["id"], "",
                       f"机械验收异常: {e}", "verify_error")
 
+    # HITL 超时闭环(票 54 task-02): 顺带过期超 24h 的待审批请求;
+    # 接在 _tick 内,once 模式(run_monitor(once=True))也执行
+    try:
+        ops.expire_force_approvals(conn)
+    except Exception:
+        pass
+
+
+def _purge_pool_logs(conn):
+    """清除超期 pool_request_logs(票 57 task-09, 监控器巡检顺带)。"""
+    retention_days = int(ops._config(conn, "pool_log_retention_days") or 30)
+    cutoff = now() - retention_days * 86400
+    result = conn.execute(
+        "DELETE FROM pool_request_logs WHERE ts < ?", (cutoff,))
+    if result.rowcount:
+        ops.audit(conn, "pool_log_purge",
+                  {"deleted": result.rowcount,
+                   "retention_days": retention_days,
+                   "cutoff_ts": cutoff})
+
+
+def _monitor_backup_once(conn):
+    """每日备份(18.5): 监控器巡检顺带,失败写 backup_failed audit 不崩溃。"""
+    try:
+        from .daemon import backup_ledger
+        backup_ledger(conn)
+    except Exception as e:
+        try:
+            ops.audit(conn, "backup_failed", {"error": str(e)})
+            # 显式落盘: 不靠下一个事务顺带提交,崩溃窗口不丢审计行
+            conn.commit()
+        except Exception:
+            pass
+
+
+def _reconcile_plugins(conn):
+    """插件对账巡检(21.4,票 23): 启用中的模板类插件逐一对账,
+    缺失/旧版机械重生成,用户改过不碰+审计升级;单个失败不拖垮其余。"""
+    from . import plugins
+    for p in plugins.list_plugins(conn):
+        if p.get("type") != "template" or not p.get("enabled", True):
+            continue
+        try:
+            plugins.reconcile(conn, p["name"])
+        except Exception:
+            pass
+
 
 def run_monitor(interval: int = 30, once: bool = False):
     conn = connect()
@@ -623,10 +698,11 @@ def run_monitor(interval: int = 30, once: bool = False):
                     ops.audit(c, "monitor_tick_error", {"error": str(e)})
             except Exception:
                 pass
-        # 每日备份(18.5): 监控器巡检顺带,每日一次(同日已存在则跳过)
+        # 每日备份(18.5): 监控器巡检顺带
+        _monitor_backup_once(conn)
+        # 日志保留期清理(票 57 task-09): 顺带清除超期 pool_request_logs
         try:
-            from .daemon import backup_ledger
-            backup_ledger(conn)
+            _purge_pool_logs(conn)
         except Exception:
             pass
         # 动态校准(7.3/9.3,票 07): 30min 窗口节流重算滑动统计
@@ -644,7 +720,14 @@ def run_monitor(interval: int = 30, once: bool = False):
         # 钩子对账巡检(17.2②,票 13): ~30min 节流,缺失/旧版机械补
         try:
             from .hooks import scan_all
-            scan_all(conn)
+            scan_out = scan_all(conn)
         except Exception:
-            pass
+            scan_out = None
+        # 插件对账巡检(21.4,票 23): 与钩子对账同窗节流,
+        # 缺失/旧版机械重生成,用户改过不碰+审计升级
+        if scan_out and "scanned" in scan_out:
+            try:
+                _reconcile_plugins(conn)
+            except Exception:
+                pass
         time.sleep(interval)

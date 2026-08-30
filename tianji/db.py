@@ -169,6 +169,13 @@ def _migrate(conn: sqlite3.Connection):
     # 票 12 补: 登记行加"已打扫"标记(上下文卫生 14.4)
     _add_column_if_missing(conn, "instance_registrations", "cleaned_at",
                            "INTEGER")
+    # 票 57 task-09 补: pool_member_health 加熔断留痕列(老账本缺列则
+    # _update_member_health 一写就 OperationalError)
+    _add_column_if_missing(conn, "pool_member_health", "circuit_state",
+                           "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(conn, "pool_member_health",
+                           "circuit_state_changed_at",
+                           "INTEGER NOT NULL DEFAULT 0")
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str,

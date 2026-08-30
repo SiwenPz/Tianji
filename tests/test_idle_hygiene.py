@@ -133,7 +133,7 @@ def test_retire_keeps_resources(conn, controller):
     ops.instance_register(conn, "老工", "codex", "step-router-v1",
                           context_window=100000)
     conn.execute("UPDATE ability_profiles SET score=77 WHERE instance_name='老工'")
-    ops.instance_unbind(conn, "老工", request_id="rh-unbind")
+    ops.instance_unbind(conn, controller, "老工", request_id="rh-unbind")
     p = conn.execute("SELECT score FROM ability_profiles"
                      " WHERE instance_name='老工'").fetchone()
     assert p["score"] == 77  # 回收≠删实例: 表现分保留

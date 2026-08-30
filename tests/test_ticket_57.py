@@ -307,13 +307,9 @@ class TestExhaustionSignal:
                     resp = urllib.request.urlopen(req, timeout=10)
                 except urllib.error.HTTPError as exc:
                     resp_status = exc.code
-                else:
-                    resp_status = resp.status
 
-                # 重试耗尽后返回 502
-                assert resp_status == 502
-
-                # pool_request_logs 有记录
+                # 全员429 → 透传429 (非502)
+                assert resp_status == 429
                 # 强制 WAL checkpoint 确保跨连接可见
                 pconn.execute("PRAGMA wal_checkpoint")
                 log_n = pconn.execute(
@@ -424,7 +420,7 @@ class TestPoolRecovery:
                 try:
                     urllib.request.urlopen(req, timeout=10)
                 except urllib.error.HTTPError as exc:
-                    assert exc.code == 502
+                    assert exc.code == 429
 
                 pconn.execute("PRAGMA wal_checkpoint")
                 qrow = pconn.execute(
@@ -512,3 +508,503 @@ class TestCockpitPoolSummary:
         rendered = cockpit.render_snapshot(snap)
         assert "号池摘要" in rendered
         assert "test-pool" in rendered
+
+
+# ---------------------------------------------------------------------------
+# ⑦ SSE 流式逐块透传
+# ---------------------------------------------------------------------------
+
+class _BackendStreaming(BaseHTTPRequestHandler):
+    """模拟 SSE 后端: 逐块推送事件(块间有间隔),关闭连接标记结束。"""
+    _CHUNKS = [b"data: hello\n\n", b"data: world\n\n"]
+    _GAP = 1.0  # 块间间隔(秒): 整量缓冲实现下首块到达时间≈整体时长
+
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        for c in self._CHUNKS:
+            self.wfile.write(c)
+            self.wfile.flush()
+            time.sleep(self._GAP)
+        self.close_connection = True
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+class TestSSEStreaming:
+
+    def test_sse_streaming_body(self, pconn, pctx):
+        """SSE 响应应逐块读上游→逐块写回客户端,不过整量缓冲。"""
+        backend = HTTPServer(("127.0.0.1", 0), _BackendStreaming)
+        backend_port = backend.server_address[1]
+        bt = threading.Thread(target=backend.serve_forever, daemon=True)
+        bt.start()
+        try:
+            prov = ops._config(
+                pconn, "integration_provider:" + pctx["prov"])
+            if isinstance(prov, str):
+                prov = json.loads(prov)
+            prov["base_url"] = f"http://127.0.0.1:{backend_port}"
+            pconn.execute(
+                "UPDATE configs SET value=? WHERE key=?",
+                (json.dumps(prov, ensure_ascii=False),
+                 "integration_provider:" + pctx["prov"]))
+
+            pool_token = pconn.execute(
+                "SELECT value FROM configs WHERE key=?",
+                ("pool:token:" + pctx["pool_name"],)).fetchone()["value"]
+
+            proxy_port = 19012
+            pt = threading.Thread(
+                target=run_proxy, args=(proxy_port,), daemon=True)
+            pt.start()
+            try:
+                time.sleep(0.5)
+                body = json.dumps({"model": "test-model"}).encode()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{proxy_port}/proxy/{pctx['pool_name']}"
+                    f"/v1/chat/completions?token={pool_token}",
+                    data=body,
+                    headers={"Content-Type": "application/json",
+                             "Accept": "text/event-stream"},
+                    method="POST")
+                t0 = time.monotonic()
+                resp = urllib.request.urlopen(req, timeout=10)
+                first = resp.read(1)
+                t_first = time.monotonic() - t0  # 首块到达耗时
+                raw = first + resp.read()
+                t_total = time.monotonic() - t0  # 整体时长
+                assert b"hello" in raw
+                assert b"world" in raw
+                # SSE 使用 chunked transfer encoding,不应有 Content-Length
+                assert "Content-Length" not in resp.headers
+                # 逐块透传: 首块到达远小于整体时长;整量缓冲实现此处 ≈ t_total
+                assert t_total >= _BackendStreaming._GAP * 2 * 0.8, (
+                    f"整体时长 {t_total:.2f}s 应 ≥ 块间间隔×2")
+                assert t_first < t_total * 0.5, (
+                    f"首块 {t_first:.2f}s 应远小于整体 {t_total:.2f}s")
+            finally:
+                pt.join(timeout=2)
+        finally:
+            backend.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# ⑧ 超时三件套: 首字节 / 流空闲 / 总时长
+# ---------------------------------------------------------------------------
+
+class _BackendSlowFirstByte(BaseHTTPRequestHandler):
+    """后端延迟发送首字节。"""
+    def do_POST(self):
+        time.sleep(5)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+        self.close_connection = True
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+class _BackendSlowBodyTrickle(BaseHTTPRequestHandler):
+    """非流式: 响应头+声明 Content-Length 立即发,body 涓流(永不发完)。"""
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "100")
+        self.end_headers()
+        self.wfile.write(b"{}")  # 只发 2/100 字节,然后停摆
+        self.wfile.flush()
+        time.sleep(10)  # 远超测试 tt=2 总时长
+        self.close_connection = True
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+class _BackendStreamingGap(BaseHTTPRequestHandler):
+    """流式响应: 首块立即,第二块 delayed。"""
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(b"data: first\n\n")
+        self.wfile.flush()
+        time.sleep(3)  # 测试设 1s 流空闲超时,3>1 → 应超时
+        self.wfile.write(b"data: second\n\n")
+        self.wfile.flush()
+        self.close_connection = True
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+class _BackendSlowStream(BaseHTTPRequestHandler):
+    """流式响应: 小块持续发送,整体超总时长后仍在发。"""
+    def do_POST(self):
+        self._chunks_sent = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        while True:
+            time.sleep(0.5)
+            chunk = b"data: chunk-%d\n\n" % self._chunks_sent
+            self.wfile.write(chunk)
+            self.wfile.flush()
+            self._chunks_sent += 1
+        self.close_connection = True
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+def _set_timeout_config(pconn, fb=2, si=1, tt=5, mr=2):
+    """辅助: 把超时参数写账本(供 proxy 读取)。"""
+    pconn.execute(
+        "UPDATE configs SET value=? WHERE key=?",
+        (str(fb), "pool_proxy.timeout_first_byte"))
+    pconn.execute(
+        "UPDATE configs SET value=? WHERE key=?",
+        (str(si), "pool_proxy.timeout_stream_idle"))
+    pconn.execute(
+        "UPDATE configs SET value=? WHERE key=?",
+        (str(tt), "pool_proxy.timeout_total"))
+    pconn.execute(
+        "UPDATE configs SET value=? WHERE key=?",
+        (str(mr), "pool_proxy.max_retries"))
+
+
+@pytest.mark.timeout(30)
+class TestProxyTimeouts:
+
+    def test_first_byte_timeout(self, pconn, pctx):
+        """首字节超时: 后端延迟 > 配置首字节超时 → 502。"""
+        backend = HTTPServer(("127.0.0.1", 0), _BackendSlowFirstByte)
+        backend_port = backend.server_address[1]
+        bt = threading.Thread(target=backend.serve_forever, daemon=True)
+        bt.start()
+        try:
+            prov = ops._config(
+                pconn, "integration_provider:" + pctx["prov"])
+            if isinstance(prov, str):
+                prov = json.loads(prov)
+            prov["base_url"] = f"http://127.0.0.1:{backend_port}"
+            pconn.execute(
+                "UPDATE configs SET value=? WHERE key=?",
+                (json.dumps(prov, ensure_ascii=False),
+                 "integration_provider:" + pctx["prov"]))
+            _set_timeout_config(pconn, fb=2, si=10, tt=60, mr=0)
+
+            pool_token = pconn.execute(
+                "SELECT value FROM configs WHERE key=?",
+                ("pool:token:" + pctx["pool_name"],)).fetchone()["value"]
+
+            proxy_port = 19014
+            pt = threading.Thread(
+                target=run_proxy, args=(proxy_port,), daemon=True)
+            pt.start()
+            try:
+                time.sleep(0.5)
+                body = json.dumps({"model": "test-model"}).encode()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{proxy_port}/proxy/{pctx['pool_name']}"
+                    f"/v1/chat/completions?token={pool_token}",
+                    data=body,
+                    headers={"Content-Type": "application/json",
+                             "Accept": "text/event-stream"},
+                    method="POST")
+                try:
+                    resp = urllib.request.urlopen(req, timeout=15)
+                    assert False, "Expected timeout error"
+                except urllib.error.HTTPError as exc:
+                    assert exc.code == 502
+            finally:
+                pt.join(timeout=2)
+        finally:
+            backend.shutdown()
+
+    def test_stream_idle_timeout(self, pconn, pctx):
+        """流空闲超时: SSE 块间隔 > 配置 → 502。"""
+        backend = HTTPServer(("127.0.0.1", 0), _BackendStreamingGap)
+        backend_port = backend.server_address[1]
+        bt = threading.Thread(target=backend.serve_forever, daemon=True)
+        bt.start()
+        try:
+            prov = ops._config(
+                pconn, "integration_provider:" + pctx["prov"])
+            if isinstance(prov, str):
+                prov = json.loads(prov)
+            prov["base_url"] = f"http://127.0.0.1:{backend_port}"
+            pconn.execute(
+                "UPDATE configs SET value=? WHERE key=?",
+                (json.dumps(prov, ensure_ascii=False),
+                 "integration_provider:" + pctx["prov"]))
+            _set_timeout_config(pconn, fb=10, si=1, tt=60, mr=0)
+
+            pool_token = pconn.execute(
+                "SELECT value FROM configs WHERE key=?",
+                ("pool:token:" + pctx["pool_name"],)).fetchone()["value"]
+
+            proxy_port = 19016
+            pt = threading.Thread(
+                target=run_proxy, args=(proxy_port,), daemon=True)
+            pt.start()
+            try:
+                time.sleep(0.5)
+                body = json.dumps({"model": "test-model"}).encode()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{proxy_port}/proxy/{pctx['pool_name']}"
+                    f"/v1/chat/completions?token={pool_token}",
+                    data=body,
+                    headers={"Content-Type": "application/json",
+                             "Accept": "text/event-stream"},
+                    method="POST")
+                # 首块已发→流中空闲超时→proxy 截断 chunked 流(连接中断)。
+                # 客户端读体必抛错;旧写法 assert False + except Exception: pass 会假绿。
+                import http.client as _hc
+                with pytest.raises((_hc.IncompleteRead, urllib.error.URLError,
+                                    ConnectionError, OSError)):
+                    resp = urllib.request.urlopen(req, timeout=15)
+                    resp.read()  # chunked 流被截断 → 读体必抛
+            finally:
+                pt.join(timeout=2)
+        finally:
+            backend.shutdown()
+
+    def test_total_timeout(self, pconn, pctx):
+        """总时长超时: SSE 流超过总时长 → 502。"""
+        backend = HTTPServer(("127.0.0.1", 0), _BackendSlowStream)
+        backend_port = backend.server_address[1]
+        bt = threading.Thread(target=backend.serve_forever, daemon=True)
+        bt.start()
+        try:
+            prov = ops._config(
+                pconn, "integration_provider:" + pctx["prov"])
+            if isinstance(prov, str):
+                prov = json.loads(prov)
+            prov["base_url"] = f"http://127.0.0.1:{backend_port}"
+            pconn.execute(
+                "UPDATE configs SET value=? WHERE key=?",
+                (json.dumps(prov, ensure_ascii=False),
+                 "integration_provider:" + pctx["prov"]))
+            _set_timeout_config(pconn, fb=1, si=10, tt=2, mr=0)
+
+            pool_token = pconn.execute(
+                "SELECT value FROM configs WHERE key=?",
+                ("pool:token:" + pctx["pool_name"],)).fetchone()["value"]
+
+            proxy_port = 19018
+            pt = threading.Thread(
+                target=run_proxy, args=(proxy_port,), daemon=True)
+            pt.start()
+            try:
+                time.sleep(0.5)
+                body = json.dumps({"model": "test-model"}).encode()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{proxy_port}/proxy/{pctx['pool_name']}"
+                    f"/v1/chat/completions?token={pool_token}",
+                    data=body,
+                    headers={"Content-Type": "application/json",
+                             "Accept": "text/event-stream"},
+                    method="POST")
+                # 流超总时长→proxy 截断 chunked 流(连接中断),读体必抛。
+                import http.client as _hc
+                with pytest.raises((_hc.IncompleteRead, urllib.error.URLError,
+                                    ConnectionError, OSError)):
+                    resp = urllib.request.urlopen(req, timeout=15)
+                    resp.read()  # chunked 流被截断 → 读体必抛
+            finally:
+                pt.join(timeout=2)
+        finally:
+            backend.shutdown()
+
+    def test_nonstream_total_timeout(self, pconn, pctx):
+        """非流式总时长截止: 响应头已到但 body 涓流 → 超 timeout_total → 502。
+
+        (首字节超时管不到这里——头已拿到;须由 timeout_total 兜底。)
+        """
+        backend = HTTPServer(("127.0.0.1", 0), _BackendSlowBodyTrickle)
+        backend_port = backend.server_address[1]
+        bt = threading.Thread(target=backend.serve_forever, daemon=True)
+        bt.start()
+        try:
+            prov = ops._config(
+                pconn, "integration_provider:" + pctx["prov"])
+            if isinstance(prov, str):
+                prov = json.loads(prov)
+            prov["base_url"] = f"http://127.0.0.1:{backend_port}"
+            pconn.execute(
+                "UPDATE configs SET value=? WHERE key=?",
+                (json.dumps(prov, ensure_ascii=False),
+                 "integration_provider:" + pctx["prov"]))
+            _set_timeout_config(pconn, fb=10, si=10, tt=2, mr=0)
+
+            pool_token = pconn.execute(
+                "SELECT value FROM configs WHERE key=?",
+                ("pool:token:" + pctx["pool_name"],)).fetchone()["value"]
+
+            proxy_port = 19024
+            pt = threading.Thread(
+                target=run_proxy, args=(proxy_port,), daemon=True)
+            pt.start()
+            try:
+                time.sleep(0.5)
+                body = json.dumps({"model": "test-model"}).encode()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{proxy_port}/proxy/{pctx['pool_name']}"
+                    f"/v1/chat/completions?token={pool_token}",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                t0 = time.monotonic()
+                with pytest.raises(urllib.error.HTTPError) as exc_info:
+                    urllib.request.urlopen(req, timeout=15)
+                elapsed = time.monotonic() - t0
+                assert exc_info.value.code == 502
+                # 总时长 2s 截止(而非 fb=10 或悬挂)
+                assert elapsed < 8, (
+                    f"应在 timeout_total=2s 附近失败,实际 {elapsed:.2f}s")
+            finally:
+                pt.join(timeout=2)
+        finally:
+            backend.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# ⑨ 429 透传 Retry-After
+# ---------------------------------------------------------------------------
+
+class _Backend429WithRetryAfter(BaseHTTPRequestHandler):
+    """返回 429 和 Retry-After 头。"""
+    def do_POST(self):
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Retry-After", "5")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+        self.close_connection = True
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+class _Backend429EventStream(BaseHTTPRequestHandler):
+    """以 text/event-stream 形态返回 429(错误码检查必须先于流式判定)。"""
+    def do_POST(self):
+        self.send_response(429)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Retry-After", "7")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+        self.close_connection = True
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+@pytest.mark.timeout(30)
+class Test429BubbleHeaders:
+
+    def test_429_bubbles_with_retry_after(self, pconn, pctx):
+        backend = HTTPServer(("127.0.0.1", 0), _Backend429WithRetryAfter)
+        backend_port = backend.server_address[1]
+        bt = threading.Thread(target=backend.serve_forever, daemon=True)
+        bt.start()
+        try:
+            prov = ops._config(
+                pconn, "integration_provider:" + pctx["prov"])
+            if isinstance(prov, str):
+                prov = json.loads(prov)
+            prov["base_url"] = f"http://127.0.0.1:{backend_port}"
+            pconn.execute(
+                "UPDATE configs SET value=? WHERE key=?",
+                (json.dumps(prov, ensure_ascii=False),
+                 "integration_provider:" + pctx["prov"]))
+
+            pool_token = pconn.execute(
+                "SELECT value FROM configs WHERE key=?",
+                ("pool:token:" + pctx["pool_name"],)).fetchone()["value"]
+
+            proxy_port = 19020
+            pt = threading.Thread(
+                target=run_proxy, args=(proxy_port,), daemon=True)
+            pt.start()
+            try:
+                time.sleep(0.5)
+                body = json.dumps({"model": "test-model"}).encode()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{proxy_port}/proxy/{pctx['pool_name']}"
+                    f"/v1/chat/completions?token={pool_token}",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                try:
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    resp_status = resp.status
+                    resp_body = resp.read()
+                    assert False, "Expected 429"
+                except urllib.error.HTTPError as exc:
+                    resp_status = exc.code
+                    assert exc.code == 429
+                    ra = exc.headers.get("Retry-After", "")
+                    assert ra == "5"
+            finally:
+                pt.join(timeout=2)
+        finally:
+            backend.shutdown()
+
+    def test_429_with_event_stream_content_type_not_treated_as_success(
+            self, pconn, pctx):
+        """上游以 text/event-stream 返回 429: 必须按错误处理(进 all_429
+        口径→冒泡 429),不能因 SSE 形态被当成功透传 200。"""
+        backend = HTTPServer(("127.0.0.1", 0), _Backend429EventStream)
+        backend_port = backend.server_address[1]
+        bt = threading.Thread(target=backend.serve_forever, daemon=True)
+        bt.start()
+        try:
+            prov = ops._config(
+                pconn, "integration_provider:" + pctx["prov"])
+            if isinstance(prov, str):
+                prov = json.loads(prov)
+            prov["base_url"] = f"http://127.0.0.1:{backend_port}"
+            pconn.execute(
+                "UPDATE configs SET value=? WHERE key=?",
+                (json.dumps(prov, ensure_ascii=False),
+                 "integration_provider:" + pctx["prov"]))
+
+            pool_token = pconn.execute(
+                "SELECT value FROM configs WHERE key=?",
+                ("pool:token:" + pctx["pool_name"],)).fetchone()["value"]
+
+            proxy_port = 19022
+            pt = threading.Thread(
+                target=run_proxy, args=(proxy_port,), daemon=True)
+            pt.start()
+            try:
+                time.sleep(0.5)
+                body = json.dumps({"model": "test-model"}).encode()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{proxy_port}/proxy/{pctx['pool_name']}"
+                    f"/v1/chat/completions?token={pool_token}",
+                    data=body,
+                    headers={"Content-Type": "application/json",
+                             "Accept": "text/event-stream"},
+                    method="POST")
+                with pytest.raises(urllib.error.HTTPError) as exc_info:
+                    urllib.request.urlopen(req, timeout=10)
+                # SSE 形态的 429 仍按 429 冒泡(带 Retry-After),不是 200
+                assert exc_info.value.code == 429
+                assert exc_info.value.headers.get("Retry-After") == "7"
+            finally:
+                pt.join(timeout=2)
+        finally:
+            backend.shutdown()

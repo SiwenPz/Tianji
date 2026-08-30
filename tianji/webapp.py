@@ -766,6 +766,78 @@ def api_setup_state():
         conn.close()
 
 
+# 主题(票 24): Web API
+@app.get("/api/theme/state")
+async def api_theme_state():
+    conn = connect()
+    try:
+        return _theme_state(conn)
+    finally:
+        conn.close()
+
+
+@app.post("/api/theme/enable")
+async def api_theme_enable(req: Request):
+    body = await req.json()
+    name = (body.get("name") or "三国").strip()
+    conn = connect()
+    try:
+        ident = _require_controller(conn)
+        if ident is None:
+            return JSONResponse({"error": "需总控身份"}, status_code=403)
+        from .theme import enable
+        rid = f"theme-enable-{hashlib.md5(name.encode()).hexdigest()[:8]}"
+        try:
+            return enable(conn, ident, name, request_id=rid)
+        except (KeyError, ValueError) as e:
+            # 未知主题名等客户端错误 → 400 带明确信息,不裸 500
+            return JSONResponse(
+                {"error": e.args[0] if e.args else str(e)}, status_code=400)
+    finally:
+        conn.close()
+
+
+@app.post("/api/theme/disable")
+async def api_theme_disable(req: Request = None):
+    conn = connect()
+    try:
+        ident = _require_controller(conn)
+        if ident is None:
+            return JSONResponse({"error": "需总控身份"}, status_code=403)
+        from .theme import disable
+        rid = f"theme-disable-{hashlib.md5(b'disable').hexdigest()[:8]}"
+        return disable(conn, ident, request_id=rid)
+    finally:
+        conn.close()
+
+
+def _theme_state(conn):
+    from . import theme
+    info = theme.list_themes(conn)
+    return info
+
+
+# 插件展示块(票 23/25): 视图类插件运行期渲染,fail-open
+@app.get("/api/plugin/blocks")
+def api_plugin_blocks():
+    conn = connect()
+    try:
+        from . import plugins
+        snap = conn.execute(
+            "SELECT type, COUNT(*) AS n FROM dispatches WHERE status IN ('issued','active')"
+            " GROUP BY type").fetchall()
+        snapshot = {"dispatches": [dict(r) for r in snap], "pools": []}
+        try:
+            blocks = plugins.render_view_blocks(conn, snapshot)
+        except Exception as e:
+            ops.audit(conn, "plugin_blocks_error",
+                      {"error": str(e)})
+            blocks = [f"(插件渲染异常: {e})"]
+        return {"blocks": blocks}
+    finally:
+        conn.close()
+
+
 @app.post("/api/integrations/discover-models")
 async def api_integrations_discover(req: Request):
     """模型发现(票33): 已登记供应商或自定义 base_url+协议保底探测;
@@ -923,13 +995,16 @@ async def api_setup_land(req: Request):
                     skip_test=True, confirm=True, role_note=role,
                     request_id=f"web-land-{name}")
                 registered.append(r["name"])
-            # 票59: 落地后归池
+            # 票59: 落地后归池(使用 card.key_name,不依赖 r——r 仅在 count>have 时定义)
+            card_key_name = card.get("key_name", "")
             pool_name = (card.get("pool") or "").strip()
-            if pool_name and r.get("key_name"):
+            if pool_name and card_key_name:
                 try:
+                    # 生成 request_id 用名(既使 count<=have 也访问不到循环内 name)
+                    name_for_pool = _next_instance_name(conn, role)
                     pool_mod.pool_add_member(conn, ident, pool_name,
-                        r["key_name"],
-                        request_id=f"web-land-pool-{name}")
+                        card_key_name,
+                        request_id=f"web-land-pool-{name_for_pool}")
                 except (KeyError, ValueError):
                     pass  # Non-fatal: pool assignment failed, instance still created
         return {**res, "registered": registered, "state": _setup_state(conn)}
@@ -946,7 +1021,23 @@ def index():
 
 @app.get("/setup", response_class=HTMLResponse)
 def setup_page():
-    """首次配置页(变体 B 一屏全览): 选总控/配一张牌/编制总览实时生长。"""
+    """首次配置页(变体 B 一屏全览): 选总控/配一张牌/编制总览实时生长。
+
+    票 52: 过场问候("你好,天机")语言跟随 user_language,缺翻译回退中文。
+    """
+    lang = "zh"
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT value FROM configs WHERE key='user_language'").fetchone()
+        lang = row["value"] if row else "zh"
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    if lang == "en":
+        return HTMLResponse(_SETUP_PAGE.replace(
+            'text:"你好,天机"', 'text:"Hello, Tianji"'))
     return _SETUP_PAGE
 
 
@@ -1032,6 +1123,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
   <button class="btn-ghost" onclick="openOrg()"><span class="ic">🗂️</span>角色/条目</button></div>
   <div id="cfgbar"></div>
   <div class="stream" id="stream"><div id="flowcards"></div></div>
+  <div id="plugin-blocks" style="padding:4px 16px"></div>
   <div class="inputbar"><input id="msg" placeholder="跟总控说话 …(批准 16 / 驳回 16 也可以直接敲)">
   <button class="btn-send" onclick="sendMsg()">发送</button></div>
  </div>
@@ -1429,7 +1521,7 @@ function renderCtrl(e){
   const d=ctrlLine();
   d.innerHTML=`<div class="esc-card" style="margin-bottom:0"><b>总控出错:</b> ${esc(e.text||"未知错误")}</div>`;}
  // system 其余子类(init 等)过滤不显示
- st.scrollTop=st.scrollHeight}
+ autoScroll()}
 async function pollCtrl(){
  try{const r=await j("/api/ctrl/events?after="+ctrlNext);
   ctrlNext=r.next;
@@ -1448,17 +1540,29 @@ async function sendMsg(){
   ctrlAssistantDiv=null;ctrlThinkDiv=null;ctrlDelta=false;
   const w=ctrlLine();w.style.display="flex";
   const b=document.createElement("div");b.className="bubble-u";b.textContent=text;w.appendChild(b);
-  const st=document.getElementById("stream");st.scrollTop=st.scrollHeight;
+  autoScroll();
   ctrlStatus("总控正在输入…");
   const r=await j("/api/ctrl/send",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
   if(r.error){ctrlStatusOff();alert(r.error);}}
  el.value="";poll();pollCtrl()}
+function autoScroll(){
+ const st=document.getElementById("stream");
+ if(!st)return;
+ if(st.scrollHeight-st.scrollTop-st.clientHeight>120)return;
+ st.scrollTop=st.scrollHeight}
+async function renderPluginBlocks(){
+ const box=document.getElementById("plugin-blocks");
+ if(!box)return;
+ try{const r=await j("/api/plugin/blocks");
+  box.innerHTML=(r.blocks||[]).map(b=>`<div style="margin:4px 0;padding:8px;background:#131b30;border:1px solid #1c2642;border-radius:8px;font-size:12px">${esc(b)}</div>`).join("")}
+ catch(e){box.innerHTML=""}}
 async function poll(){try{render(await j("/api/state"))}catch(e){}}
 document.getElementById("msg").addEventListener("keydown",e=>{if(e.key==="Enter")sendMsg()});
 poll();pollCtrl();pollCtrlStatus();
-setInterval(()=>{poll();pollCtrl();pollCtrlStatus();
+setInterval(()=>{poll();pollCtrl();pollCtrlStatus();renderPluginBlocks();
  if(peekOf==="__org__")renderRegistry();
  else if(peekOf)refreshDetail(peekOf)},1500);
+renderPluginBlocks();
 </script></body></html>"""
 
 
@@ -1548,6 +1652,16 @@ th{color:#8fa3c8}
    </div>
    <button class="primary" onclick="addCard()">加入编制(立即落账)</button>
    <span class="muted">每张牌点这个就算配好,不用最后统一提交</span>
+  </div>
+  <div class="panel" style="flex:1"><h2>主题</h2>
+   <div class="row" style="align-items:center;gap:8px">
+    <label class="muted">启用主题:</label>
+    <button id="theme-on" class="primary" onclick="themeOn()">开</button>
+    <button id="theme-off" onclick="themeOff()">关</button>
+    <span id="theme-name" class="muted"></span>
+    <select id="theme-pick" style="min-width:120px"></select>
+   </div>
+   <div class="muted" style="margin-top:8px">主题=总控话术腔调(纯装饰,不影响任务流转)。默认关,开了请刷新总控会话。</div>
   </div>
   <div class="panel" style="flex:1"><h2>编制总览</h2>
    <div id="roster"></div>
@@ -1692,7 +1806,22 @@ async function setProjectDir(){
  el("pd-msg").textContent="已保存";S=r.state;render()}
 (async function(){
  S=await j("/api/setup/state");
- fillShells();fillProviders();fillPools();srcToggle("c");srcToggle("w");kimiHintToggle();render()})();
+ fillShells();fillProviders();fillPools();fillThemes();srcToggle("c");srcToggle("w");kimiHintToggle();render()})();
+async function fillThemes(){
+ try{const r=await j("/api/theme/state");
+  const sel=el("theme-pick");if(!sel)return;
+  sel.innerHTML="";
+  const themes=r.themes||{};
+  for(const n of Object.keys(themes)){const o=document.createElement("option");o.value=n;o.textContent=n;sel.appendChild(o)}
+  el("theme-name").textContent=r.enabled?"当前: "+r.enabled:"当前: 无(默认)"}
+ catch(e){})
+async function themeOn(){
+ const n=el("theme-pick")?.value||"三国";
+ const r=await j("/api/theme/enable",{method:"POST",headers:CT,body:JSON.stringify({name:n})});
+ if(!r.error){el("theme-name").textContent="当前: "+n;alert("主题已开: "+n+(r.note?" ("+r.note+")":""))}}
+async function themeOff(){
+ const r=await j("/api/theme/disable",{method:"POST",headers:CT,body:JSON.stringify({})});
+ if(!r.error){el("theme-name").textContent="当前: 无(默认)";alert("主题已关")}}
 async function assignPool(name,pool){
  if(!pool)return;
  if(cockpitReadonly){alert("只读: 未注入总控身份");return}
