@@ -47,7 +47,7 @@ git status                                           # 确认人在票分支上�
 ## 第四步：环境和基线
 
 ```bash
-pip install -e .          # 装过会秒过，可跳过
+pip install -e ".[dev]"   # 装过会秒过，可跳过（[dev] 含 pytest/httpx/zstandard 等测试依赖）
 python -m pytest tests -q # 全量测试
 ```
 
@@ -77,7 +77,7 @@ git log --oneline origin/main | head -8   # 看前置票是否已合并
 
 ## 工作方式
 
-- 一切工作在你的票分支上进行，**绝不碰 main**——main 是发布用的单提交快照，只有审核通过后由维护方合并。
+- 一切工作在你的票分支上进行，**绝不碰 main**——main 是集成分支，只有审核通过后由维护方合并 PR 才进 main，不直接推。
 - 做完推到 GitHub 对应分支，开 PR：base=main，head=你的票分支，PR 描述按任务书的交活清单写。
 - 审核方在 PR 上审你的代码（对照任务书逐条验收），有问题在 PR 评论里提，你改完推同一分支。
 
