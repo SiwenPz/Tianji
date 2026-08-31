@@ -3,7 +3,7 @@
 ## 仓库结构
 
 - `tianji/` — 原型实现(账本 CLI / 监控器 / daemon / 驾驶舱);核心纯标准库 sqlite3,外围 typer/FastAPI+uvicorn/pytest
-- `tests/` — pytest 套件(508)
+- `tests/` — pytest 套件(813)
 - `docs/agents/` — agent 工作约定(见下)
 - `.scratch/<effort>/` — 设计与实现地图(**不公开**,见发布纪律)
 - `demo/` — 演示账本与实例材料(gitignored,含 secret,绝不入库)
@@ -30,7 +30,7 @@ GitHub 公开仓是洗掉 `.scratch` 的单提交新历史(设计文档不公开
 
 ## 测试
 
-`python -m pytest tests -q`(508,全绿才可收尾一票)
+`python -m pytest tests -q`(813,全绿才可收尾一票)
 
 ## Domain docs
 
