@@ -1328,7 +1328,7 @@ function renderPeek(){
     }
    }
    pp.innerHTML=h;
-  }}
+  }}}
 function instHtml(name){
  const c=snapCards[name]||{instance_name:name};
  const shell=shellOf(name);
@@ -1352,6 +1352,7 @@ function instHtml(name){
  <div class="peek-acts">
  <button class="btn-ghost" ${did?"":"disabled"} onclick="nudge(${did||0})">续推 nudge</button>
  <button class="btn-no" ${(tid||did)?"":"disabled"} onclick="force(${tid||"null"},${did||"null"})">强制干预…</button></div>`
+}
 /* 续推 nudge: 无专用接口(零新增接口),走 /api/ctrl/send 请总控续推(花钱动作归总控 14.5) */
 async function nudge(did){
  if(cockpitReadonly){alert("只读: 未注入总控身份");return}
@@ -1814,7 +1815,7 @@ async function fillThemes(){
   const themes=r.themes||{};
   for(const n of Object.keys(themes)){const o=document.createElement("option");o.value=n;o.textContent=n;sel.appendChild(o)}
   el("theme-name").textContent=r.enabled?"当前: "+r.enabled:"当前: 无(默认)"}
- catch(e){})
+ catch(e){}}
 async function themeOn(){
  const n=el("theme-pick")?.value||"三国";
  const r=await j("/api/theme/enable",{method:"POST",headers:CT,body:JSON.stringify({name:n})});
