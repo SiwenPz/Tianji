@@ -1,0 +1,34 @@
+{
+  "description": "Cross-language ledger identity fixture: the Python sink and the Command Code mod must derive identical identities from one event. The detail is deliberately non-empty and nested -- with an empty detail the two sides agree by accident, which hides a key-ordering divergence at depth.",
+  "input": {
+    "host": "cmdc",
+    "event": "subagent_start",
+    "session_id": "sess-1",
+    "toolCallId": "call-probe",
+    "agent": "tianji-probe",
+    "detail": {
+      "toolName": "read_file",
+      "tokensUsed": 120,
+      "showOutput": true,
+      "inner": {
+        "zeta": "z",
+        "alpha": "a",
+        "middle": {
+          "second": 2,
+          "first": 1
+        }
+      },
+      "list": [3, 2, 1]
+    },
+    "ts": "2026-09-10T12:00:00+00:00"
+  },
+  "expected": {
+    "event_id": "cmdc:8fc0fda3cbc8a0111a139119c0bc9316",
+    "binding_file": "bindings/cmdc/sess-1/correlation-d8c4f22e1f1b4257411181b006eee09c67743b93051a69afc5cdd5681aef8010.json",
+    "event_key": {
+      "run_id": "77802c0c-d50f-4fe8-bc09-8ea018cf2334",
+      "task_id": "task-a",
+      "attempt": 1
+    }
+  }
+}

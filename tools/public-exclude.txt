@@ -1,0 +1,23 @@
+# What is held back from the public repository.
+#
+# The public repository is a curated export of this tree, not a mirror of it.
+# This file is the whole split between the two: one glob per line, `#` starts a
+# comment. A pattern that matches nothing is an error, so the list cannot rot
+# into a false sense of safety.
+
+# Working documents. They record how Tianji was built on one machine: dated
+# logs, incidents, model observations, and indexes of material that is not in
+# this repository at all. Useful to the people building it, noise to everyone
+# else -- and they carry machine-specific paths and names besides.
+docs/HANDOVER.md
+docs/PRD.md
+docs/STEP3-RESUME.md
+docs/HOST-PAYLOAD-AUDIT.md
+docs/tianji-proxy-eval.md
+
+# The exam paper for grading Tianji's own review pipeline, and the tool that
+# mines it. This is how the system is measured, not a capability it offers: it
+# grades configurations, it does not review code, and a reader looking for what
+# Tianji does would learn nothing from it but that its authors test it.
+tools/bug-library/
+tools/mine_bug_pairs.py

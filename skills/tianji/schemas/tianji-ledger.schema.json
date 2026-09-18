@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tianji.local/schemas/tianji-ledger.schema.json",
+  "title": "Tianji ledger event v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "event",
+    "host",
+    "run_id",
+    "session_id",
+    "task_id",
+    "attempt",
+    "invocation_id",
+    "correlation_id",
+    "agent",
+    "occurred_at",
+    "recorded_at",
+    "detail"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "event_id": {"type": "string", "minLength": 1},
+    "event": {"type": "string", "minLength": 1},
+    "host": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "format": "uuid"},
+    "session_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "attempt": {"type": "integer", "minimum": 1},
+    "invocation_id": {"type": "string", "minLength": 1},
+    "correlation_id": {"type": "string", "minLength": 1},
+    "agent": {"type": "string", "minLength": 1},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "detail": {"type": "object"}
+  }
+}
